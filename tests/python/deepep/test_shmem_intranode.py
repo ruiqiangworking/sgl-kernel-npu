@@ -25,55 +25,6 @@ from utils import (
 )
 
 
-def assert_dispatch_layout(
-    actual_num_tokens_per_rank: torch.Tensor,
-    actual_num_tokens_per_expert: torch.Tensor,
-    actual_is_token_in_rank: torch.Tensor,
-    expected_num_tokens_per_rank: torch.Tensor,
-    expected_num_tokens_per_expert: torch.Tensor,
-    expected_is_token_in_rank: torch.Tensor,
-    rank: int,
-) -> None:
-    """
-    断言 get_dispatch_layout 的输出与预期值匹配。
-
-    Args:
-        actual_num_tokens_per_rank: get_dispatch_layout 返回的 num_tokens_per_rank
-        actual_num_tokens_per_expert: get_dispatch_layout 返回的 num_tokens_per_expert
-        actual_is_token_in_rank: get_dispatch_layout 返回的 is_token_in_rank
-        expected_num_tokens_per_rank: 预期的 num_tokens_per_rank
-        expected_num_tokens_per_expert: 预期的 num_tokens_per_expert
-        expected_is_token_in_rank: 预期的 is_token_in_rank
-        rank: 当前rank编号，用于错误信息
-
-    Raises:
-        AssertionError: 如果任何字段不匹配
-    """
-    assert torch.allclose(
-        actual_num_tokens_per_rank, expected_num_tokens_per_rank
-    ), (
-        f"num_tokens_per_rank mismatch on rank {rank}:\n"
-        f"  Expected: {expected_num_tokens_per_rank}\n"
-        f"  Actual:   {actual_num_tokens_per_rank}"
-    )
-
-    assert torch.allclose(
-        actual_num_tokens_per_expert, expected_num_tokens_per_expert
-    ), (
-        f"num_tokens_per_expert mismatch on rank {rank}:\n"
-        f"  Expected: {expected_num_tokens_per_expert}\n"
-        f"  Actual:   {actual_num_tokens_per_expert}"
-    )
-
-    assert torch.allclose(
-        actual_is_token_in_rank, expected_is_token_in_rank
-    ), (
-        f"is_token_in_rank mismatch on rank {rank}:\n"
-        f"  Expected: {expected_is_token_in_rank}\n"
-        f"  Actual:   {actual_is_token_in_rank}"
-    )
-
-
 def verify_dispatch_layout(
     topk_idx: torch.Tensor,
     num_experts: int,
@@ -137,20 +88,107 @@ def verify_dispatch_layout(
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
     is_token_in_rank = (token_idx_in_rank >= 0).to(torch.int)
 
-    # 校验
-    assert_dispatch_layout(
-        actual_num_tokens_per_rank,
-        actual_num_tokens_per_expert,
-        actual_is_token_in_rank,
-        num_tokens_per_rank,
-        num_tokens_per_expert,
-        is_token_in_rank,
-        rank,
+    # 断言验证
+    assert torch.allclose(
+        actual_num_tokens_per_rank, num_tokens_per_rank
+    ), (
+        f"num_tokens_per_rank mismatch on rank {rank}:\n"
+        f"  Expected: {num_tokens_per_rank}\n"
+        f"  Actual:   {actual_num_tokens_per_rank}"
+    )
+
+    assert torch.allclose(
+        actual_num_tokens_per_expert, num_tokens_per_expert
+    ), (
+        f"num_tokens_per_expert mismatch on rank {rank}:\n"
+        f"  Expected: {num_tokens_per_expert}\n"
+        f"  Actual:   {actual_num_tokens_per_expert}"
+    )
+
+    assert torch.allclose(
+        actual_is_token_in_rank, is_token_in_rank
+    ), (
+        f"is_token_in_rank mismatch on rank {rank}:\n"
+        f"  Expected: {is_token_in_rank}\n"
+        f"  Actual:   {actual_is_token_in_rank}"
     )
 
     print(f"{rank=}, dispatch_layout passed", flush=True)
 
     return gbl_num_tokens_per_expert
+
+
+def verify_dispatch_output(
+    gbl_num_tokens_per_expert: torch.Tensor,
+    recv_num_tokens_per_expert_list: list,
+    rank: int,
+    num_ranks: int,
+    expert_token_nums_type: int,
+) -> None:
+    """
+    验证 dispatch 算子的输出是否正确。
+
+    Args:
+        gbl_num_tokens_per_expert: all_reduce 后的全局 num_tokens_per_expert
+        recv_num_tokens_per_expert_list: dispatch 返回的 num_tokens_per_expert_list
+        rank: 当前rank编号
+        num_ranks: 总rank数量
+        expert_token_nums_type: expert token nums 的类型（0: 累积和, 1: 原始值）
+
+    Raises:
+        AssertionError: 如果验证失败
+    """
+    local_expert_token = gbl_num_tokens_per_expert.view(num_ranks, -1)[rank]
+    if expert_token_nums_type == 0:
+        expected_list = local_expert_token.cumsum(dim=0).tolist()
+    else:
+        expected_list = local_expert_token.tolist()
+
+    assert expected_list == recv_num_tokens_per_expert_list, (
+        f"num_tokens_per_expert_list mismatch on rank {rank}:\n"
+        f"  Expected: {expected_list}\n"
+        f"  Actual:   {recv_num_tokens_per_expert_list}"
+    )
+
+    print(f"{rank=}, dispatch output passed", flush=True)
+
+
+def verify_combine_output(
+    combined_x: torch.Tensor,
+    original_x: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_idx: torch.Tensor,
+    rank: int,
+    threshold: float = 5e-5,
+) -> None:
+    """
+    验证 combine 算子的输出是否正确。
+
+    Args:
+        combined_x: combine 返回的合并后的张量
+        original_x: 原始输入张量
+        topk_weights: topk 权重张量
+        topk_idx: topk 索引张量
+        rank: 当前rank编号
+        threshold: 误差阈值
+
+    Raises:
+        AssertionError: 如果验证失败
+    """
+    check_x = combined_x.float()
+    expected_x = original_x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1)
+    
+    diff = calc_diff(check_x, expected_x)
+    
+    assert diff < threshold, (
+        f"combine output mismatch on rank {rank}:\n"
+        f"  Diff: {diff}\n"
+        f"  Threshold: {threshold}\n"
+        f"  Combined shape: {combined_x.shape}\n"
+        f"  Expected shape: {expected_x.shape}"
+    )
+
+    print(f"{rank=}, combine output passed", flush=True)
 
 
 g_ash_size = 2 * 1024 * 1024 * 1024
@@ -318,16 +356,6 @@ def test_main(
         (num_tokens, num_topk), dtype=torch.float32, device="npu"
     )
 
-    # Test dispatch
-    # noinspection PyShadowingNames
-    def check_data(check_x, rank_prefix_matrix):
-        assert torch.allclose(check_x.amin(dim=1), check_x.amax(dim=1))
-        check_start = 0
-        for i in range(num_ranks):
-            check_end = rank_prefix_matrix[i][rank].item()
-            assert (check_x[check_start:check_end, :].int() - i).sum().item() == 0
-            check_start = check_end
-
     def get_num_tokens_per_expert_list(rank: int):
         local_expert_token = gbl_num_tokens_per_expert.view(num_ranks, -1)[rank]
         if expert_token_nums_type == 0:
@@ -389,15 +417,19 @@ def test_main(
                 else recv_x
             )
 
-            # Checks notify output
-            local_expert_token_list = get_num_tokens_per_expert_list(rank)
-            assert local_expert_token_list == recv_num_tokens_per_expert_list
+            # 验证 dispatch 输出
+            verify_dispatch_output(
+                gbl_num_tokens_per_expert,
+                recv_num_tokens_per_expert_list,
+                rank,
+                num_ranks,
+                expert_token_nums_type,
+            )
 
             all_recv_count = handle[8]
-
-            total_recv_tokens = sum(local_expert_token_list)
+            total_recv_tokens = sum(recv_num_tokens_per_expert_list)
             print(
-                f"{rank=}, {total_recv_tokens=} {recv_x.shape}, dispatch passed",
+                f"{rank=}, {total_recv_tokens=} {recv_x.shape}",
                 flush=True,
             )
 
@@ -410,16 +442,15 @@ def test_main(
                 "topk_weights": handle[7],
             }
             combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
-            check_x = combined_x.float()
+            
+            # 验证 combine 输出
             ref_x = x_pure_rand if current_x is x_pure_rand else x
-
-            assert (
-                calc_diff(
-                    check_x,
-                    ref_x
-                    * handle[7].masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1),
-                )
-                < 5e-5
+            verify_combine_output(
+                combined_x,
+                ref_x,
+                handle[7],
+                topk_idx,
+                rank,
             )
 
             del recv_x  # release symmetric tensor
