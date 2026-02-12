@@ -24,6 +24,135 @@ from utils import (
     per_token_cast_back,
 )
 
+
+def assert_dispatch_layout(
+    actual_num_tokens_per_rank: torch.Tensor,
+    actual_num_tokens_per_expert: torch.Tensor,
+    actual_is_token_in_rank: torch.Tensor,
+    expected_num_tokens_per_rank: torch.Tensor,
+    expected_num_tokens_per_expert: torch.Tensor,
+    expected_is_token_in_rank: torch.Tensor,
+    rank: int,
+) -> None:
+    """
+    断言 get_dispatch_layout 的输出与预期值匹配。
+
+    Args:
+        actual_num_tokens_per_rank: get_dispatch_layout 返回的 num_tokens_per_rank
+        actual_num_tokens_per_expert: get_dispatch_layout 返回的 num_tokens_per_expert
+        actual_is_token_in_rank: get_dispatch_layout 返回的 is_token_in_rank
+        expected_num_tokens_per_rank: 预期的 num_tokens_per_rank
+        expected_num_tokens_per_expert: 预期的 num_tokens_per_expert
+        expected_is_token_in_rank: 预期的 is_token_in_rank
+        rank: 当前rank编号，用于错误信息
+
+    Raises:
+        AssertionError: 如果任何字段不匹配
+    """
+    assert torch.allclose(
+        actual_num_tokens_per_rank, expected_num_tokens_per_rank
+    ), (
+        f"num_tokens_per_rank mismatch on rank {rank}:\n"
+        f"  Expected: {expected_num_tokens_per_rank}\n"
+        f"  Actual:   {actual_num_tokens_per_rank}"
+    )
+
+    assert torch.allclose(
+        actual_num_tokens_per_expert, expected_num_tokens_per_expert
+    ), (
+        f"num_tokens_per_expert mismatch on rank {rank}:\n"
+        f"  Expected: {expected_num_tokens_per_expert}\n"
+        f"  Actual:   {actual_num_tokens_per_expert}"
+    )
+
+    assert torch.allclose(
+        actual_is_token_in_rank, expected_is_token_in_rank
+    ), (
+        f"is_token_in_rank mismatch on rank {rank}:\n"
+        f"  Expected: {expected_is_token_in_rank}\n"
+        f"  Actual:   {actual_is_token_in_rank}"
+    )
+
+
+def verify_dispatch_layout(
+    topk_idx: torch.Tensor,
+    num_experts: int,
+    num_ranks: int,
+    rank: int,
+    group: dist.ProcessGroup,
+    actual_num_tokens_per_rank: torch.Tensor,
+    actual_num_tokens_per_expert: torch.Tensor,
+    actual_is_token_in_rank: torch.Tensor,
+) -> torch.Tensor:
+    """
+    计算预期的 dispatch layout 并验证 get_dispatch_layout 的输出是否正确。
+
+    Args:
+        topk_idx: shape (num_tokens, num_topk) 的张量，每个token选择的expert索引
+        num_experts: 总expert数量
+        num_ranks: 总rank数量
+        rank: 当前rank编号
+        group: 分布式进程组
+        actual_num_tokens_per_rank: get_dispatch_layout 返回的 num_tokens_per_rank
+        actual_num_tokens_per_expert: get_dispatch_layout 返回的 num_tokens_per_expert
+        actual_is_token_in_rank: get_dispatch_layout 返回的 is_token_in_rank
+
+    Returns:
+        torch.Tensor: all_reduce 后的全局 num_tokens_per_expert (gbl_num_tokens_per_expert)
+
+    Raises:
+        AssertionError: 如果验证失败
+    """
+    num_tokens = topk_idx.shape[0]
+    experts_per_rank = num_experts // num_ranks
+    device = topk_idx.device
+
+    # 计算 rank_idx
+    rank_idx = topk_idx // experts_per_rank
+    rank_idx = rank_idx.clone()  # 避免修改原始数据
+    rank_idx.masked_fill_(topk_idx == -1, -1)
+    inplace_unique(rank_idx, num_ranks)
+
+    # 计算预期的 num_tokens_per_expert
+    num_tokens_per_expert = torch.zeros((num_experts,), dtype=torch.int, device=device)
+    for i in range(num_experts):
+        num_tokens_per_expert[i] = (topk_idx == i).sum()
+    gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
+    dist.all_reduce(gbl_num_tokens_per_expert, group=group)
+
+    # 计算预期的 num_tokens_per_rank 和 is_token_in_rank
+    num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, device=device)
+    token_idx_in_rank = torch.full(
+        (num_ranks, num_tokens), -1, dtype=torch.long, device=device
+    )
+    for i in range(num_ranks):
+        num_tokens_per_rank[i] = (rank_idx == i).sum()
+        token_sel = (rank_idx == i).max(dim=-1)[0]
+        count = token_sel.sum().item()
+        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+        tokens[:count] = torch.sort(tokens[:count])[0]
+        token_idx_in_rank[i][tokens[:count]] = torch.arange(
+            count, dtype=torch.long, device=device
+        )
+    token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
+    is_token_in_rank = (token_idx_in_rank >= 0).to(torch.int)
+
+    # 校验
+    assert_dispatch_layout(
+        actual_num_tokens_per_rank,
+        actual_num_tokens_per_expert,
+        actual_is_token_in_rank,
+        num_tokens_per_rank,
+        num_tokens_per_expert,
+        is_token_in_rank,
+        rank,
+    )
+
+    print(f"{rank=}, dispatch_layout passed", flush=True)
+
+    return gbl_num_tokens_per_expert
+
+
 g_ash_size = 2 * 1024 * 1024 * 1024
 G_IP_PORT = "tcp://127.0.0.1:8688"
 
@@ -149,39 +278,10 @@ def test_main(
         #     for k in range(num_topk):
         #         topk_idx[t, k] = (start + k) % num_experts
 
-    rank_idx = topk_idx // experts_per_rank
-    rank_idx.masked_fill_(topk_idx == -1, -1)
-    inplace_unique(rank_idx, num_ranks)
-
-    # Expert meta
-    num_tokens_per_expert = torch.zeros((num_experts,), dtype=torch.int, device="npu")
-    for i in range(num_experts):
-        num_tokens_per_expert[i] = (topk_idx == i).sum()
-    gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
-    dist.all_reduce(gbl_num_tokens_per_expert, group=group)
-
-    # Rank layout meta
-    num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, device="npu")
-    token_idx_in_rank = torch.full(
-        (num_ranks, num_tokens), -1, dtype=torch.long, device="npu"
-    )
-    for i in range(num_ranks):
-        num_tokens_per_rank[i] = (rank_idx == i).sum()
-        token_sel = (rank_idx == i).max(dim=-1)[0]
-        count = token_sel.sum().item()
-        tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
-        tokens[:count] = torch.sort(tokens[:count])[0]
-        token_idx_in_rank[i][tokens[:count]] = torch.arange(
-            count, dtype=torch.long, device="npu"
-        )
-    token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
-    is_token_in_rank = (token_idx_in_rank >= 0).to(torch.int)
-    gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
-    dist.all_reduce(gbl_num_tokens_per_rank, group=group)
-
     dist.barrier()
     time.sleep(1)
 
+    # 调用 get_dispatch_layout
     return_values = buffer.get_dispatch_layout(topk_idx, num_experts)
     (
         ref_num_tokens_per_rank,
@@ -190,20 +290,18 @@ def test_main(
         ref_is_token_in_rank,
         _,
     ) = return_values
-    try:
-        assert torch.allclose(
-            ref_num_tokens_per_rank, num_tokens_per_rank
-        ), f"Assertion num_tokens_per_rank failed on rank {rank}: Expected {num_tokens_per_rank}, Actual {ref_num_tokens_per_rank}"
-        assert torch.allclose(
-            ref_num_tokens_per_expert, num_tokens_per_expert
-        ), f"Assertion num_tokens_per_expert failed on rank {rank}: Expected {num_tokens_per_expert}, Actual {ref_num_tokens_per_expert}"
-        assert torch.allclose(
-            ref_is_token_in_rank, is_token_in_rank
-        ), f"Assertion is_token_in_rank failed on rank {rank}: Expected {is_token_in_rank}, Actual {ref_is_token_in_rank}"
-    except AssertionError as e:
-        print(e)
-        raise
-    print(f"{rank=}, dispatch_layout passed", flush=True)
+
+    # 验证 dispatch layout 输出是否正确
+    gbl_num_tokens_per_expert = verify_dispatch_layout(
+        topk_idx,
+        num_experts,
+        num_ranks,
+        rank,
+        group,
+        ref_num_tokens_per_rank,
+        ref_num_tokens_per_expert,
+        ref_is_token_in_rank,
+    )
 
     # Config
     buffer_size = 256
