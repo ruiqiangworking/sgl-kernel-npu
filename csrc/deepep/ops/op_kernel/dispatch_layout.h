@@ -174,6 +174,7 @@ public:
             DataCopyPad(numTokensPerExpertGM_, numTokensPerExpertTensor, numTokensPerExpertDataCopyParams);
             AscendC::SetAtomicNone();
             PipeBarrier<PIPE_MTE3>();
+            SyncAll<true>();
         }
 
         // Sync all cores after phase 1
@@ -229,6 +230,7 @@ public:
             DataCopyPad(sendTokenIdxSmallGM_[roundStart * numTopk_], sendTokenIdxSmallTensor,
                         sendTokenIdxSmallDataCopyParams);
             PipeBarrier<PIPE_MTE3>();
+            SyncAll<true>();
         }
     }
 
