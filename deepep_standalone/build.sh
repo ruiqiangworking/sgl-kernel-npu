@@ -2,16 +2,11 @@
 set -e
 
 # Configuration options
-BUILD_DEEPEP_OPS="ON"  # Set to "OFF" to build ops2 instead of ops
 DEBUG_MODE="OFF"
 
 # Parse command line arguments
-while getopts ":2dh" opt; do
+while getopts ":dh" opt; do
     case ${opt} in
-        2 )
-            BUILD_DEEPEP_OPS="OFF"
-            echo "Building with ops2"
-            ;;
         d )
             DEBUG_MODE="ON"
             echo "Debug mode enabled"
@@ -19,9 +14,9 @@ while getopts ":2dh" opt; do
         h )
             echo "Usage: ./build.sh [options]"
             echo "Options:"
-            echo "  -2    Build with ops2 instead of ops"
             echo "  -d    Enable debug mode"
             echo "  -h    Show this help message"
+            echo "Default SOC_VERSION: Ascend910_93"
             exit 0
             ;;
         \? )
@@ -94,14 +89,7 @@ function build_deepep_kernels()
     echo "Building DeepEP Kernels"
     echo "========================================="
     
-    if [[ "$BUILD_DEEPEP_OPS" == "ON" ]]; then
-        KERNEL_DIR="csrc/deepep/ops"
-        echo "Building ops (ops version 1)"
-    else
-        KERNEL_DIR="csrc/deepep/ops2"
-        echo "Building ops2 (ops version 2)"
-    fi
-    
+    KERNEL_DIR="csrc/deepep/ops"
     CUSTOM_OPP_DIR="${CURRENT_DIR}/python/deep_ep/deep_ep"
 
     cd "$KERNEL_DIR" || exit

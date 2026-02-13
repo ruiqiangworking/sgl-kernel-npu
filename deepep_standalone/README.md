@@ -10,8 +10,7 @@ deepep_standalone/
 ├── README.md            # 本文档
 ├── csrc/                # C++ 源码
 │   └── deepep/          # DeepEP 内核源码
-│       ├── ops/         # ops 版本1
-│       └── ops2/        # ops 版本2
+│       └── ops/         # 内核算子
 └── python/              # Python 包源码
     └── deep_ep/         # DeepEP Python 包
 ```
@@ -28,16 +27,10 @@ export SHMEM_HOME_PATH=/usr/local/Ascend/shmem/latest
 
 ## 构建命令
 
-### 基本构建（使用 ops 版本1）
+### 基本构建
 
 ```bash
 ./build.sh
-```
-
-### 使用 ops2 版本构建
-
-```bash
-./build.sh -2
 ```
 
 ### 调试模式构建
@@ -55,12 +48,11 @@ export SHMEM_HOME_PATH=/usr/local/Ascend/shmem/latest
 ### 组合选项
 
 ```bash
-./build.sh -2 -d Ascend910_9382
+./build.sh -d Ascend910_9382
 ```
 
 ## 构建选项
 
-- `-2`: 使用 ops2 版本代替 ops 版本1
 - `-d`: 启用调试模式
 - `-h`: 显示帮助信息
 
@@ -104,7 +96,6 @@ pip3 install --force-reinstall output/deep_ep*.whl
 ```bash
 rm -rf output/
 rm -rf csrc/deepep/ops/build_out/
-rm -rf csrc/deepep/ops2/build_out/
 rm -rf python/deep_ep/build/
 rm -rf python/deep_ep/dist/
 rm -rf python/deep_ep/deep_ep.egg-info/
