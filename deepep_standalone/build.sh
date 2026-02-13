@@ -81,6 +81,40 @@ mkdir -p $OUTPUT_DIR/lib
 
 echo "Output path: ${OUTPUT_DIR}"
 
+# Function: Build DeepEP Adapter (C++ extension)
+function build_deepep_adapter()
+{
+    echo ""
+    echo "========================================="
+    echo "Building DeepEP Adapter Module"
+    echo "========================================="
+    
+    BUILD_DIR="$CURRENT_DIR/build"
+    mkdir -p "$BUILD_DIR"
+    
+    cd "$CURRENT_DIR" || exit
+    
+    # Configure CMake
+    echo "Configuring CMake..."
+    cmake -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
+          -DASCEND_HOME_PATH="$ASCEND_HOME_PATH" \
+          -DSHMEM_HOME_PATH="$SHMEM_HOME_PATH" \
+          -DCMAKE_BUILD_TYPE=RELEASE \
+          -B "$BUILD_DIR" \
+          -S .
+    
+    # Build
+    echo "Building adapter module..."
+    cmake --build "$BUILD_DIR" -j8
+    
+    # Install to output directory
+    echo "Installing to output directory..."
+    cmake --build "$BUILD_DIR" --target install
+    
+    cd - > /dev/null
+    echo "DeepEP adapter build completed successfully!"
+}
+
 # Function: Build DeepEP Kernels
 function build_deepep_kernels()
 {
@@ -149,7 +183,10 @@ function make_deepep_package()
     # Clean previous builds
     echo "Cleaning previous builds..."
     rm -rf "$CURRENT_DIR"/python/deep_ep/build
-    rm -rf "$CURRENT_DIR"/python/deep_ep/dist
+    rm -rf "adapter
+    build_deepep_adapter
+    
+    # Build $CURRENT_DIR"/python/deep_ep/dist
     rm -rf "$CURRENT_DIR"/python/deep_ep/deep_ep.egg-info
     
     # Build wheel package
@@ -182,6 +219,9 @@ function main()
         echo "Installing Python wheel package..."
         pip3 install wheel==0.45.1
     fi
+    
+    # Build adapter
+    build_deepep_adapter
     
     # Build kernels
     build_deepep_kernels
