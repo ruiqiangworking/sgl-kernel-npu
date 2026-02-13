@@ -81,6 +81,14 @@ mkdir -p $OUTPUT_DIR/lib
 
 echo "Output path: ${OUTPUT_DIR}"
 
+# Compile options
+COMPILE_OPTIONS=""
+if [ "$DEBUG_MODE" == "ON" ]; then
+    COMPILE_OPTIONS="-DCMAKE_BUILD_TYPE=Debug"
+else
+    COMPILE_OPTIONS="-DCMAKE_BUILD_TYPE=Release"
+fi
+
 # Function: Build DeepEP Adapter (C++ extension)
 function build_deepep_adapter()
 {
@@ -96,10 +104,12 @@ function build_deepep_adapter()
     
     # Configure CMake
     echo "Configuring CMake..."
-    cmake -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
+    cmake $COMPILE_OPTIONS \
+          -DCMAKE_INSTALL_PREFIX="$OUTPUT_DIR" \
           -DASCEND_HOME_PATH="$ASCEND_HOME_PATH" \
+          -DASCEND_INCLUDE_DIR="$ASCEND_INCLUDE_DIR" \
           -DSHMEM_HOME_PATH="$SHMEM_HOME_PATH" \
-          -DCMAKE_BUILD_TYPE=RELEASE \
+          -DSOC_VERSION="$SOC_VERSION" \
           -B "$BUILD_DIR" \
           -S .
     
