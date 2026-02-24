@@ -152,35 +152,32 @@ def run_fixed_dispatch(
         actual_recv_x = _per_token_cast_back_shmem(*actual_recv_x, local_rank)
 
     # ------------------------------------------------------------------ #
-    # 5. 纯本地推导 expected recv_x（CPU numpy，节省 NPU 显存）
+    # 5. 纯数学推导 expected recv_x（CPU numpy，节省 NPU 显存）
     #
-    #    因为 topk_idx 的生成公式完全由命令行入参（num_tokens, num_topk,
-    #    num_experts）和 src_rank 编号决定，当前 rank 可在本地为每个
-    #    src_rank 重建相同的 topk_idx，判断哪些 token 会被 dispatch 过来，
-    #    最终按 src_rank 升序拼接得到 expected recv_x。
+    #    recv_x 的行顺序：expert 升序（外层）→ src_rank 升序（中层）→ token 升序（内层）
     #
-    #    公式（与步骤 1 完全一致，仅将 rank 替换为 src_rank）：
-    #      start = (src_rank * num_tokens + t) % num_experts
-    #      topk  = [start+0, start+1, ..., start+num_topk-1] % num_experts
+    #    对于每个 (expert_abs, src_rank) 对，反解哪些 token 会将 expert_abs 发送到
+    #    当前 rank。由 topk_idx 生成公式：
+    #        expert = (src_rank * num_tokens + t + k) % num_experts,  k ∈ [0, num_topk)
+    #    令 expert = expert_abs，反解 t：
+    #        t = (expert_abs - src_rank * num_tokens - k) % num_experts,  k ∈ [0, num_topk)
+    #    筛选满足 0 ≤ t < num_tokens 的候选值并升序排列，即为实际发来的 token 索引。
+    #    对应 recv_x 的值全为 float(src_rank)（因为 fixed_x[t,:] = src_rank）。
     # ------------------------------------------------------------------ #
     my_expert_start = rank * experts_per_rank
     my_expert_end = (rank + 1) * experts_per_rank
 
-    t_np = np.arange(num_tokens, dtype=np.int64)   # (num_tokens,)
-    k_np = np.arange(num_topk,   dtype=np.int64)   # (num_topk,)
+    k_np = np.arange(num_topk, dtype=np.int64)   # (num_topk,)
 
     expected_recv_blocks: list[np.ndarray] = []
-    expected_src_info: list[tuple[int, int]] = []   # (expert_abs, src_rank, cnt)
-    # recv_x 的行顺序：按本地 expert 升序为外层，每个 expert 内按 src_rank 升序，
-    # 同一 src_rank 内按 token 原始升序。与 dispatch 组织方式对齐。
+    expected_src_info: list[tuple[int, int, int]] = []  # (expert_abs, src_rank, cnt)
     for expert_abs in range(my_expert_start, my_expert_end):
         for src_rank in range(num_ranks):
-            # 本地重建 src_rank 的 topk_idx（CPU numpy）
-            src_start = (src_rank * num_tokens + t_np) % num_experts          # (num_tokens,)
-            src_topk  = (src_start[:, None] + k_np[None, :]) % num_experts    # (num_tokens, num_topk)
-            # 选中了 expert_abs 的 token（token 天然按升序排列）
-            selected = (src_topk == expert_abs).any(axis=1)                    # (num_tokens,)
-            cnt = int(selected.sum())
+            # 反解：t = (expert_abs - src_rank * num_tokens - k) % num_experts
+            t_candidates = (expert_abs - src_rank * num_tokens - k_np) % num_experts
+            # 筛选合法 token 范围并升序（不同 k 给出不同 t，无需去重）
+            valid_tokens = np.sort(t_candidates[t_candidates < num_tokens])
+            cnt = len(valid_tokens)
             expected_src_info.append((expert_abs, src_rank, cnt))
             if cnt > 0:
                 # 来自 src_rank 的 token，hidden 值全为 float(src_rank)
