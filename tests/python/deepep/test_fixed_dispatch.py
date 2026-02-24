@@ -152,35 +152,40 @@ def run_fixed_dispatch(
         actual_recv_x = _per_token_cast_back_shmem(*actual_recv_x, local_rank)
 
     # ------------------------------------------------------------------ #
-    # 5. 纯数学推导 expected recv_x（CPU numpy，节省 NPU 显存）
+    # 5. 模拟 dispatch 运行推导 expected recv_x（CPU numpy，节省 NPU 显存）
     #
     #    recv_x 的行顺序：expert 升序（外层）→ src_rank 升序（中层）→ token 升序（内层）
     #
-    #    对于每个 (expert_abs, src_rank) 对，反解哪些 token 会将 expert_abs 发送到
-    #    当前 rank。由 topk_idx 生成公式：
-    #        expert = (src_rank * num_tokens + t + k) % num_experts,  k ∈ [0, num_topk)
-    #    令 expert = expert_abs，反解 t：
-    #        t = (expert_abs - src_rank * num_tokens - k) % num_experts,  k ∈ [0, num_topk)
-    #    筛选满足 0 ≤ t < num_tokens 的候选值并升序排列，即为实际发来的 token 索引。
-    #    对应 recv_x 的值全为 float(src_rank)（因为 fixed_x[t,:] = src_rank）。
+    #    步骤：
+    #    (a) 重建整个通讯域所有 rank 的 topk_idx（与构造 fixed_topk_idx 的公式相同）。
+    #    (b) 对本 rank 负责的每个 expert，遍历每个 src_rank，找出该 src_rank 中哪些
+    #        token 的 topk_idx 包含该 expert（token 升序），得到 token_per_rank。
+    #    (c) 因为 fixed_x[t, :] = float(src_rank)，对应块用 src_rank 值填充。
     # ------------------------------------------------------------------ #
     my_expert_start = rank * experts_per_rank
     my_expert_end = (rank + 1) * experts_per_rank
 
-    k_np = np.arange(num_topk, dtype=np.int64)   # (num_topk,)
+    # (a) 重建所有 rank 的 topk_idx（CPU numpy）
+    t_np = np.arange(num_tokens, dtype=np.int64)          # (num_tokens,)
+    k_np = np.arange(num_topk, dtype=np.int64)            # (num_topk,)
+    all_topk_idx: list[np.ndarray] = []
+    for src_rank in range(num_ranks):
+        start_np = (src_rank * num_tokens + t_np) % num_experts  # (num_tokens,)
+        topk_np = (start_np[:, None] + k_np[None, :]) % num_experts  # (num_tokens, num_topk)
+        all_topk_idx.append(topk_np)
 
+    # (b)(c) 按 expert 升序 → src_rank 升序 → token 升序 填充 expected_np
     expected_recv_blocks: list[np.ndarray] = []
     expected_src_info: list[tuple[int, int, int]] = []  # (expert_abs, src_rank, cnt)
     for expert_abs in range(my_expert_start, my_expert_end):
         for src_rank in range(num_ranks):
-            # 反解：t = (expert_abs - src_rank * num_tokens - k) % num_experts
-            t_candidates = (expert_abs - src_rank * num_tokens - k_np) % num_experts
-            # 筛选合法 token 范围并升序（不同 k 给出不同 t，无需去重）
-            valid_tokens = np.sort(t_candidates[t_candidates < num_tokens])
-            cnt = len(valid_tokens)
+            topk_np = all_topk_idx[src_rank]               # (num_tokens, num_topk)
+            # 找出 topk 中包含 expert_abs 的 token（token 索引已天然升序）
+            mask = np.any(topk_np == expert_abs, axis=1)   # (num_tokens,)
+            cnt = int(mask.sum())
             expected_src_info.append((expert_abs, src_rank, cnt))
             if cnt > 0:
-                # 来自 src_rank 的 token，hidden 值全为 float(src_rank)
+                # fixed_x[t, :] = float(src_rank)，故整块填充 src_rank 值
                 expected_recv_blocks.append(
                     np.full((cnt, hidden), float(src_rank), dtype=np.float32)
                 )
