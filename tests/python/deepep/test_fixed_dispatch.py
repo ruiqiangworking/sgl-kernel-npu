@@ -170,21 +170,24 @@ def run_fixed_dispatch(
     k_np = np.arange(num_topk,   dtype=np.int64)   # (num_topk,)
 
     expected_recv_blocks: list[np.ndarray] = []
-    expected_src_info: list[tuple[int, int]] = []   # (src_rank, num_tokens_from_src)
+    expected_src_info: list[tuple[int, int]] = []   # (src_rank, total_dispatches_from_src)
     for src_rank in range(num_ranks):
         # 本地重建 src_rank 的 topk_idx（CPU numpy）
         src_start = (src_rank * num_tokens + t_np) % num_experts          # (num_tokens,)
         src_topk  = (src_start[:, None] + k_np[None, :]) % num_experts    # (num_tokens, num_topk)
-        # 判断哪些 token 选了当前 rank 的 expert
-        has_my_expert = (
+        # 统计每个 token 在当前 rank 上命中的 expert 数量
+        # dispatch 是按 (token, expert) 对发送的：同一 token 命中 k 个 expert
+        # 就发送 k 次，recv_x 中对应 k 行，因此必须用 sum 而非 any
+        expert_match = (
             (src_topk >= my_expert_start) & (src_topk < my_expert_end)
-        ).any(axis=1)                                                       # (num_tokens,)
-        cnt = int(has_my_expert.sum())
-        expected_src_info.append((src_rank, cnt))
-        if cnt > 0:
-            # 来自 src_rank 的 token 全部填充为 src_rank 值（x[t,:]=src_rank）
+        )                                                                   # (num_tokens, num_topk)
+        num_dispatches_per_token = expert_match.sum(axis=1)                # (num_tokens,)
+        total_dispatches = int(num_dispatches_per_token.sum())
+        expected_src_info.append((src_rank, total_dispatches))
+        if total_dispatches > 0:
+            # 来自 src_rank 的每次 dispatch 均填充为 src_rank 值（x[t,:]=src_rank）
             expected_recv_blocks.append(
-                np.full((cnt, hidden), float(src_rank), dtype=np.float32)
+                np.full((total_dispatches, hidden), float(src_rank), dtype=np.float32)
             )
 
     expected_np = (
