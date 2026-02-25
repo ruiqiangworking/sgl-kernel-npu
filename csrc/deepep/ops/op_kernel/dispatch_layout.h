@@ -43,6 +43,9 @@ public:
         coreIdx_ = GetBlockIdx();
         uint32_t maxAivNum = GetBlockNum();
         aivNum_ = numTokens_ <= maxAivNum ? numTokens_ : maxAivNum;
+        // Compute alignment lengths before early return so all cores can calculate tokensPerRound
+        numTokensPerRank32AlignIntLen_ = Ceil(numRanks_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN;
+        numTokensPerExpert32AlignIntLen_ = Ceil(numExperts_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN;
         if (coreIdx_ >= aivNum_) {
             return;
         }
@@ -54,8 +57,6 @@ public:
         if (coreIdx_ < restNum) {
             tempTokens_++;
         }
-        numTokensPerRank32AlignIntLen_ = Ceil(numRanks_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN;
-        numTokensPerExpert32AlignIntLen_ = Ceil(numExperts_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN;
         if (coreIdx_ < restNum) {
             topkIdxOffset = coreIdx_ * tempTokens_ * numTopk_ * sizeof(int64_t);
             isTokenOffset = coreIdx_ * tempTokens_ * numRanks_ * sizeof(T);
@@ -92,145 +93,132 @@ public:
         return tokensPerRound > 0 ? tokensPerRound : 1;
     }
 
+    // Phase 1 per-round: count tokens per rank/expert, write isTokenInRank and atomic-add counts to GM
+    __aicore__ inline void CountTokensInRound(uint32_t roundStart, uint32_t roundTokens, int expertsPerRank)
+    {
+        uint32_t topkLen = Ceil(roundTokens * numTopk_ * sizeof(int64_t), UB_32_ALIGN) * UB_32_ALIGN;
+        uint32_t isTokenLen = Ceil(roundTokens * numRanks_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN;
+        tpipe_->Reset();
+        tpipe_->InitBuffer(topkIdxBuf_, topkLen);
+        tpipe_->InitBuffer(numTokensPerRankBuf_, numTokensPerRank32AlignIntLen_);
+        tpipe_->InitBuffer(numTokensPerExpertBuf_, numTokensPerExpert32AlignIntLen_);
+        tpipe_->InitBuffer(isTokenInRankBuf_, isTokenLen);
+        tpipe_->InitBuffer(seenRankBuf_, Ceil(numRanks_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN);
+        LocalTensor<int64_t> topkIdxLocal = topkIdxBuf_.AllocTensor<int64_t>();
+        const DataCopyExtParams topkCopyParams{1U, topkLen, 0U, 0U, 0U};
+        const DataCopyPadExtParams<int64_t> topkPadParams{false, 0U, 0U, 0U};
+        DataCopyPad(topkIdxLocal, topkIdxGM_[roundStart * numTopk_], topkCopyParams, topkPadParams);
+        SyncFunc<AscendC::HardEvent::MTE2_S>();
+        LocalTensor<T> rankLocal = numTokensPerRankBuf_.AllocTensor<T>();
+        LocalTensor<T> expertLocal = numTokensPerExpertBuf_.AllocTensor<T>();
+        LocalTensor<T> isTokenLocal = isTokenInRankBuf_.AllocTensor<T>();
+        LocalTensor<T> seenLocal = seenRankBuf_.AllocTensor<T>();
+        Duplicate<T>(rankLocal, 0, numRanks_);
+        Duplicate<T>(expertLocal, 0, numExperts_);
+        Duplicate<T>(isTokenLocal, 0, roundTokens * numRanks_);
+        SyncFunc<AscendC::HardEvent::V_S>();
+        for (uint32_t i = 0; i < roundTokens; ++i) {
+            SyncFunc<AscendC::HardEvent::S_V>();
+            Duplicate<T>(seenLocal, 0, numRanks_);
+            SyncFunc<AscendC::HardEvent::V_S>();
+            for (uint32_t j = 0; j < numTopk_; ++j) {
+                int64_t expertIdx = topkIdxLocal.GetValue(i * numTopk_ + j);
+                expertLocal.SetValue(expertIdx, expertLocal.GetValue(expertIdx) + 1);
+                int rankId = expertIdx / expertsPerRank;
+                if (!seenLocal.GetValue(rankId)) {
+                    rankLocal.SetValue(rankId, rankLocal.GetValue(rankId) + 1);
+                    isTokenLocal.SetValue(i * numRanks_ + rankId, 1);
+                    seenLocal.SetValue(rankId, 1);
+                }
+            }
+        }
+        // Write isTokenInRank and atomic-add accumulated counts to GM
+        const DataCopyExtParams isTokenParams{1U, roundTokens * numRanks_ * static_cast<uint32_t>(sizeof(T)), 0U, 0U, 0U};
+        DataCopyPad(isTokenInRankGM_[roundStart * numRanks_], isTokenLocal, isTokenParams);
+        AscendC::SetAtomicAdd<T>();
+        const DataCopyExtParams tempExpertParams{1U, numTokensPerExpert32AlignIntLen_, 0U, 0U, 0U};
+        for (uint32_t i = coreIdx_ + 1; i < aivNum_; ++i) {
+            DataCopyPad(tempExpertGM_[i * numExperts_], expertLocal, tempExpertParams);
+        }
+        const DataCopyExtParams rankCopyParams{1U, numRanks_ * static_cast<uint32_t>(sizeof(T)), 0U, 0U, 0U};
+        DataCopyPad(numTokensPerRankGM_, rankLocal, rankCopyParams);
+        const DataCopyExtParams expertCopyParams{1U, numExperts_ * static_cast<uint32_t>(sizeof(T)), 0U, 0U, 0U};
+        DataCopyPad(numTokensPerExpertGM_, expertLocal, expertCopyParams);
+        AscendC::SetAtomicNone();
+        PipeBarrier<PIPE_MTE3>();
+    }
+
+    // Phase 2 per-round: compute sendTokenIdxSmall from accumulated numTokensPerExpert
+    __aicore__ inline void CalcSendTokenIdxInRound(uint32_t roundStart, uint32_t roundTokens)
+    {
+        uint32_t topkLen = Ceil(roundTokens * numTopk_ * sizeof(int64_t), UB_32_ALIGN) * UB_32_ALIGN;
+        uint32_t sendIdxLen = Ceil(roundTokens * numTopk_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN;
+        tpipe_->Reset();
+        tpipe_->InitBuffer(topkIdxBuf_, topkLen);
+        tpipe_->InitBuffer(numTokensPerExpertBuf_, numTokensPerExpert32AlignIntLen_);
+        tpipe_->InitBuffer(sendTokenIdxSmallBuf_, sendIdxLen);
+        LocalTensor<int64_t> topkIdxLocal = topkIdxBuf_.AllocTensor<int64_t>();
+        const DataCopyExtParams topkCopyParams{1U, topkLen, 0U, 0U, 0U};
+        const DataCopyPadExtParams<int64_t> topkPadParams{false, 0U, 0U, 0U};
+        DataCopyPad(topkIdxLocal, topkIdxGM_[roundStart * numTopk_], topkCopyParams, topkPadParams);
+        LocalTensor<T> expertLocal = numTokensPerExpertBuf_.AllocTensor<T>();
+        const DataCopyExtParams expertCopyParams{1U, numTokensPerExpert32AlignIntLen_, 0U, 0U, 0U};
+        const DataCopyPadExtParams<T> expertPadParams{false, 0U, 0U, 0U};
+        DataCopyPad(expertLocal, tempExpertGM_[coreIdx_ * numExperts_], expertCopyParams, expertPadParams);
+        SyncFunc<AscendC::HardEvent::MTE2_S>();
+        LocalTensor<T> sendIdxLocal = sendTokenIdxSmallBuf_.AllocTensor<T>();
+        for (uint32_t i = 0; i < roundTokens; ++i) {
+            for (uint32_t j = 0; j < numTopk_; ++j) {
+                int64_t expertIdx = topkIdxLocal.GetValue(i * numTopk_ + j);
+                T val = expertLocal(expertIdx);
+                sendIdxLocal(i * numTopk_ + j) = val;
+                expertLocal(expertIdx) = val + 1;
+            }
+        }
+        SyncFunc<AscendC::HardEvent::S_MTE3>();
+        DataCopyPad(tempExpertGM_[coreIdx_ * numExperts_], expertLocal, expertCopyParams);
+        const DataCopyExtParams sendIdxCopyParams{
+            1U, static_cast<uint32_t>(roundTokens * numTopk_ * sizeof(T)), 0U, 0U, 0U};
+        DataCopyPad(sendTokenIdxSmallGM_[roundStart * numTopk_], sendIdxLocal, sendIdxCopyParams);
+        PipeBarrier<PIPE_MTE3>();
+    }
+
     __aicore__ inline void Process()
     {
+        // All cores must compute maxNumRounds identically to ensure the same SyncAll count.
+        // tempTokens_ differs by at most 1 across cores (remainder distribution), which may
+        // cause different numRounds per core. Use the maximum to unify barrier counts.
+        uint32_t tokensPerRound = CalcTokensPerRound();
+        uint32_t maxTempTokens = aivNum_ > 0 ? (numTokens_ / aivNum_ + (numTokens_ % aivNum_ > 0 ? 1 : 0)) : 0;
+        uint32_t maxNumRounds = (maxTempTokens + tokensPerRound - 1) / tokensPerRound;
+
+        // Inactive cores: participate in all Phase 1 SyncAll barriers then return.
+        // Phase 2 has no cross-core dependency, so no SyncAll is needed there.
         if (coreIdx_ >= aivNum_) {
-            SyncAll<true>();
+            for (uint32_t i = 0; i < maxNumRounds; ++i) {
+                SyncAll<true>();
+            }
             return;
         }
 
-        uint32_t tokensPerRound = CalcTokensPerRound();
         uint32_t numRounds = (tempTokens_ + tokensPerRound - 1) / tokensPerRound;
-        int experts_per_rank = numExperts_ / numRanks_;
+        int expertsPerRank = numExperts_ / numRanks_;
 
-        // Phase 1: Process tokens in rounds and accumulate counts
-        for (uint32_t round = 0; round < numRounds; ++round) {
-            uint32_t roundStart = round * tokensPerRound;
-            uint32_t roundTokens = (round == numRounds - 1) ? (tempTokens_ - roundStart) : tokensPerRound;
-
-            // Calculate buffer sizes for this round
-            uint32_t roundTopkIdxLen = Ceil(roundTokens * numTopk_ * sizeof(int64_t), UB_32_ALIGN) * UB_32_ALIGN;
-            uint32_t roundIsTokenInRankLen = Ceil(roundTokens * numRanks_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN;
-
-            tpipe_->Reset();
-            tpipe_->InitBuffer(topkIdxBuf_, roundTopkIdxLen);
-            tpipe_->InitBuffer(numTokensPerRankBuf_, numTokensPerRank32AlignIntLen_);
-            tpipe_->InitBuffer(numTokensPerExpertBuf_, numTokensPerExpert32AlignIntLen_);
-            tpipe_->InitBuffer(isTokenInRankBuf_, roundIsTokenInRankLen);
-            tpipe_->InitBuffer(seenRankBuf_, Ceil(numRanks_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN);
-
-            // Load topkIdx for this round
-            LocalTensor<int64_t> topkIdxTensor = topkIdxBuf_.AllocTensor<int64_t>();
-            const DataCopyExtParams dataCopyParams{1U, roundTopkIdxLen, 0U, 0U, 0U};
-            const DataCopyPadExtParams<int64_t> padParams{false, 0U, 0U, 0U};
-            DataCopyPad(topkIdxTensor, topkIdxGM_[roundStart * numTopk_], dataCopyParams, padParams);
-            SyncFunc<AscendC::HardEvent::MTE2_S>();
-
-            LocalTensor<T> numTokensPerRankTensor = numTokensPerRankBuf_.AllocTensor<T>();
-            LocalTensor<T> numTokensPerExpertTensor = numTokensPerExpertBuf_.AllocTensor<T>();
-            LocalTensor<T> isTokenInRankTensor = isTokenInRankBuf_.AllocTensor<T>();
-            LocalTensor<T> seenRankTensor = seenRankBuf_.AllocTensor<T>();
-
-            Duplicate<T>(numTokensPerRankTensor, 0, numRanks_);
-            Duplicate<T>(numTokensPerExpertTensor, 0, numExperts_);
-            Duplicate<T>(isTokenInRankTensor, 0, roundTokens * numRanks_);
-            SyncFunc<AscendC::HardEvent::V_S>();
-
-            // Process tokens in this round
-            for (uint32_t i = 0; i < roundTokens; ++i) {
-                SyncFunc<AscendC::HardEvent::S_V>();
-                Duplicate<T>(seenRankTensor, 0, numRanks_);
-                SyncFunc<AscendC::HardEvent::V_S>();
-                for (uint32_t j = 0; j < numTopk_; ++j) {
-                    int64_t expert_idx = topkIdxTensor.GetValue(i * numTopk_ + j);
-                    uint32_t per_expert_num = numTokensPerExpertTensor.GetValue(expert_idx) + 1;
-                    numTokensPerExpertTensor.SetValue(expert_idx, per_expert_num);
-                    int rank_id = expert_idx / experts_per_rank;
-                    if (!seenRankTensor.GetValue(rank_id)) {
-                        uint32_t per_rank_num = numTokensPerRankTensor.GetValue(rank_id) + 1;
-                        isTokenInRankTensor.SetValue(i * numRanks_ + rank_id, 1);
-                        seenRankTensor.SetValue(rank_id, 1);
-                        numTokensPerRankTensor.SetValue(rank_id, per_rank_num);
-                    }
-                }
+        // Phase 1: Count tokens per rank/expert with cross-core atomic accumulation
+        for (uint32_t round = 0; round < maxNumRounds; ++round) {
+            if (round < numRounds) {
+                uint32_t roundStart = round * tokensPerRound;
+                uint32_t roundTokens = (round == numRounds - 1) ? (tempTokens_ - roundStart) : tokensPerRound;
+                CountTokensInRound(roundStart, roundTokens, expertsPerRank);
             }
-
-            // Write isTokenInRank for this round
-            uint32_t sendSize = roundTokens * numRanks_ * sizeof(T);
-            const DataCopyExtParams isTokenInRankDataCopyParams{1U, sendSize, 0U, 0U, 0U};
-            DataCopyPad(isTokenInRankGM_[roundStart * numRanks_], isTokenInRankTensor, isTokenInRankDataCopyParams);
-
-            // Atomic add for accumulated counts
-            AscendC::SetAtomicAdd<T>();
-            const DataCopyExtParams tempExpertDataCopyParams{1U, numTokensPerExpert32AlignIntLen_, 0U, 0U, 0U};
-            for (uint32_t i = coreIdx_ + 1; i < aivNum_; ++i) {
-                DataCopyPad(tempExpertGM_[i * numExperts_], numTokensPerExpertTensor, tempExpertDataCopyParams);
-            }
-            sendSize = numRanks_ * sizeof(T);
-            const DataCopyExtParams numTokensPerRankDataCopyParams{1U, sendSize, 0U, 0U, 0U};
-            DataCopyPad(numTokensPerRankGM_, numTokensPerRankTensor, numTokensPerRankDataCopyParams);
-            sendSize = numExperts_ * sizeof(T);
-            const DataCopyExtParams numTokensPerExpertDataCopyParams{1U, sendSize, 0U, 0U, 0U};
-            DataCopyPad(numTokensPerExpertGM_, numTokensPerExpertTensor, numTokensPerExpertDataCopyParams);
-            AscendC::SetAtomicNone();
-            PipeBarrier<PIPE_MTE3>();
             SyncAll<true>();
         }
 
-        // Sync all cores after phase 1
-        SyncAll<true>();
-
-        // Phase 2: Calculate sendTokenIdxSmall in rounds
+        // Phase 2: Calculate send token indices (no cross-core sync needed)
         for (uint32_t round = 0; round < numRounds; ++round) {
             uint32_t roundStart = round * tokensPerRound;
             uint32_t roundTokens = (round == numRounds - 1) ? (tempTokens_ - roundStart) : tokensPerRound;
-
-            // Calculate buffer sizes for this round
-            uint32_t roundTopkIdxLen = Ceil(roundTokens * numTopk_ * sizeof(int64_t), UB_32_ALIGN) * UB_32_ALIGN;
-            uint32_t roundSendTokenIdxLen = Ceil(roundTokens * numTopk_ * sizeof(T), UB_32_ALIGN) * UB_32_ALIGN;
-
-            tpipe_->Reset();
-            tpipe_->InitBuffer(topkIdxBuf_, roundTopkIdxLen);
-            tpipe_->InitBuffer(numTokensPerExpertBuf_, numTokensPerExpert32AlignIntLen_);
-            tpipe_->InitBuffer(sendTokenIdxSmallBuf_, roundSendTokenIdxLen);
-
-            // Load topkIdx for this round
-            LocalTensor<int64_t> topkIdxTensor = topkIdxBuf_.AllocTensor<int64_t>();
-            const DataCopyExtParams dataCopyParams{1U, roundTopkIdxLen, 0U, 0U, 0U};
-            const DataCopyPadExtParams<int64_t> padParams{false, 0U, 0U, 0U};
-            DataCopyPad(topkIdxTensor, topkIdxGM_[roundStart * numTopk_], dataCopyParams, padParams);
-
-            // Load accumulated numTokensPerExpert
-            LocalTensor<T> numTokensPerExpertTensor = numTokensPerExpertBuf_.AllocTensor<T>();
-            const DataCopyExtParams tempExpertDataCopyParams{1U, numTokensPerExpert32AlignIntLen_, 0U, 0U, 0U};
-            const DataCopyPadExtParams<T> tempPadParams{false, 0U, 0U, 0U};
-            DataCopyPad(numTokensPerExpertTensor, tempExpertGM_[coreIdx_ * numExperts_], tempExpertDataCopyParams,
-                        tempPadParams);
-            SyncFunc<AscendC::HardEvent::MTE2_S>();
-
-            LocalTensor<T> sendTokenIdxSmallTensor = sendTokenIdxSmallBuf_.AllocTensor<T>();
-
-            // Calculate sendTokenIdxSmall for this round
-            for (uint32_t i = 0; i < roundTokens; ++i) {
-                for (uint32_t j = 0; j < numTopk_; ++j) {
-                    int64_t expert_idx = topkIdxTensor.GetValue(i * numTopk_ + j);
-                    T valT = numTokensPerExpertTensor(expert_idx);
-                    sendTokenIdxSmallTensor(i * numTopk_ + j) = valT;
-                    numTokensPerExpertTensor(expert_idx) = valT + 1;
-                }
-            }
-
-            // Write back updated numTokensPerExpert for next round
-            SyncFunc<AscendC::HardEvent::S_MTE3>();
-            DataCopyPad(tempExpertGM_[coreIdx_ * numExperts_], numTokensPerExpertTensor, tempExpertDataCopyParams);
-
-            // Write sendTokenIdxSmall for this round
-            const DataCopyExtParams sendTokenIdxSmallDataCopyParams{
-                1U, static_cast<uint32_t>(roundTokens * numTopk_ * sizeof(T)), 0U, 0U, 0U};
-            DataCopyPad(sendTokenIdxSmallGM_[roundStart * numTopk_], sendTokenIdxSmallTensor,
-                        sendTokenIdxSmallDataCopyParams);
-            PipeBarrier<PIPE_MTE3>();
-            SyncAll<true>();
+            CalcSendTokenIdxInRound(roundStart, roundTokens);
         }
     }
 
