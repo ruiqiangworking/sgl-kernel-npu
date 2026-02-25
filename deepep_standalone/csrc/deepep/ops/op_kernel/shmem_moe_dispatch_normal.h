@@ -441,7 +441,7 @@ __aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::Process()
     if ASCEND_IS_AIV {
         InputToDstOutput();
         SyncAll<true>();
-        shmem_barrier_all();  // 全卡同步，确保数据已经获取完
+        // shmem_barrier_all();  // 全卡同步，确保数据已经获取完
     }
 }
 

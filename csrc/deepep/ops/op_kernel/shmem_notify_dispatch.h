@@ -93,7 +93,7 @@ public:
     {
         AllGatherSendData();  // allgather 每个rank的sendCount
         SyncAll<true>();
-        shmem_barrier_all();  // 全卡同步，确保数据已经获取完
+        // shmem_barrier_all();  // 全卡同步，确保数据已经获取完
 
         ReloadRecvData();
         int32_t remainBlockIdx = (blockNum_ / 2);

@@ -334,7 +334,7 @@ __aicore__ inline void ShmemMoeCombineNormal<TemplateMC2TypeFunc>::Process()
     if ASCEND_IS_AIV {  // 全aiv处理
         ReadBufferFromRemote();
         SyncAll<true>();
-        shmem_barrier_all();  // 全卡同步，确保数据已经获取完
+        // shmem_barrier_all();  // 全卡同步，确保数据已经获取完
     }
 }
 
