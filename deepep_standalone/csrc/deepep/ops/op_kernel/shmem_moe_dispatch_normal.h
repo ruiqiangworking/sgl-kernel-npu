@@ -303,7 +303,8 @@ __aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::InputToDstOutput()
         int32_t dstExpertOffset = putOffsetTensor(dstExpertId * epRankSize + epRankId);
 
         auto ptr = reinterpret_cast<__gm__ uint8_t *>(shmem_ptr(expandXOutGM, dstRankId));
-        dstGT.SetGlobalBuffer((__gm__ ExpandXOutType *)(ptr + hUBAlignSize * (dstExpertOffset + curExpertIdx)));
+        uint64_t expandXByteOffset = static_cast<uint64_t>(hUBAlignSize) * static_cast<uint64_t>(dstExpertOffset + curExpertIdx);
+        dstGT.SetGlobalBuffer((__gm__ ExpandXOutType *)(ptr + expandXByteOffset));
 
         if constexpr (DynamicQuant) {
             auto dsPtr = shmem_ptr((__gm__ uint8_t *)(dynamicScalesOutGT.GetPhyAddr()), dstRankId);

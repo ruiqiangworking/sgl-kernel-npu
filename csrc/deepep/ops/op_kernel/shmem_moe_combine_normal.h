@@ -249,7 +249,7 @@ __aicore__ inline void ShmemMoeCombineNormal<TemplateMC2TypeFunc>::ReadBufferAnd
 
         int32_t dstRankId = expertId / moeExpertPerRankNum_;
         auto ptr = reinterpret_cast<__gm__ uint8_t *>(shmem_ptr(recvXGM_, dstRankId));
-        dstGT.SetGlobalBuffer((__gm__ XType *)(ptr + hRecvXTypeLen_ * (remoteReadBase + remoteReadOffset)));
+        dstGT.SetGlobalBuffer((__gm__ XType *)(ptr + remoteReadAddr));
 
         LocalTensor<XType> tmpToken = weightedSumQueue_.AllocTensor<XType>();
         DataCopyPad(tmpToken, dstGT, xOutCopyParams, copyPadExtParams);
