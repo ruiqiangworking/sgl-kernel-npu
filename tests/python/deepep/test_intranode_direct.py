@@ -158,11 +158,11 @@ def call_get_dispatch_layout(
         is_token_in_rank,
         _event,
     ) = buffer.get_dispatch_layout(
-        topk_idx=topk_idx,
-        num_experts=num_experts,
-        previous_event=previous_event,
-        async_finish=False,
-        allocate_on_comm_stream=False,
+        topk_idx,                      # topk_idx
+        num_experts,                   # num_experts
+        previous_event,                # previous_event
+        False,                         # async
+        False,                         # allocate_on_comm_stream
     )
     return num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank
 
@@ -199,24 +199,24 @@ def call_intranode_dispatch(
         put_offset,                     # put_offset_
         _event,
     ) = buffer.intranode_dispatch(
-        x=x,
-        x_scales=None,
-        topk_idx=topk_idx,
-        topk_weights=topk_weights,
-        num_tokens_per_rank=num_tokens_per_rank,
-        is_token_in_rank=is_token_in_rank,
-        num_tokens_per_expert=num_tokens_per_expert,
-        cached_num_recv_tokens=0,
-        cached_rank_prefix_matrix=None,
-        cached_channel_prefix_matrix=None,
-        dispatch_wait_recv_cost_stats=None,
-        expert_alignment=1,
-        num_worst_tokens=0,
-        config=config,
-        previous_event=previous_event,
-        async_finish=False,
-        allocate_on_comm_stream=False,
-        use_quant=False,
+        x,                             # x
+        None,                          # x_scales
+        topk_idx,                      # topk_idx
+        topk_weights,                  # topk_weights
+        num_tokens_per_rank,           # num_tokens_per_rank
+        is_token_in_rank,              # is_token_in_rank
+        num_tokens_per_expert,         # num_tokens_per_expert
+        0,                             # cached_num_recv_tokens
+        None,                          # cached_rank_prefix_matrix
+        None,                          # cached_channel_prefix_matrix
+        None,                          # dispatch_wait_recv_cost_stats
+        1,                             # expert_alignment
+        0,                             # num_worst_tokens
+        config,                        # config
+        previous_event,                # previous_event
+        False,                         # async
+        False,                         # allocate_on_comm_stream
+        False,                         # use_quant
     )
     # 构造 combine 所需的 handle（与 Python Buffer.dispatch 一致）
     handle = (
@@ -256,13 +256,13 @@ def call_intranode_combine(
         put_offset,
     ) = handle
     combined_x, _recv_topk_weights, _event = buffer.intranode_combine(
-        x=recv_x,
-        topk_idx=topk_idx,
-        topk_weights=topk_weights,
-        src_idx=src_idx,
-        send_head=send_head,
-        put_offset=put_offset,
-        combine_send_cost_stats=None,
+        recv_x,                        # x
+        topk_idx,                      # topk_idx
+        topk_weights,                  # topk_weights
+        src_idx,                       # src_idx
+        send_head,                     # send_head
+        put_offset,                    # put_offset
+        None,                          # combine_send_cost_stats
     )
     return combined_x
 
@@ -766,12 +766,12 @@ def test_loop(
         moe_all_to_all_group_name = ""
 
     buffer = deep_ep_cpp.Buffer(
-        rank=rank,
-        num_ranks=num_ranks,
-        num_nvl_bytes=int(2e9),
-        num_rdma_bytes=0,
-        low_latency_mode=False,
-        moe_all_to_all_group_name=moe_all_to_all_group_name,
+        rank,                          # rank
+        num_ranks,                     # num_ranks
+        int(2e9),                      # num_nvl_bytes
+        0,                             # num_rdma_bytes
+        False,                         # low_latency_mode
+        moe_all_to_all_group_name,     # moe_all_to_all_group_name
     )
     print(f"[Rank {rank}] Buffer created OK.", flush=True)
 
