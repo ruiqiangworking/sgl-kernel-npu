@@ -27,10 +27,12 @@ import time
 from functools import partial
 from typing import List, Optional, Tuple
 
-import deep_ep_cpp
 import numpy as np
 import torch
+import torch_npu
 import torch.distributed as dist
+import deep_ep
+import deep_ep_cpp
 
 from hccl_dispatcher import HCCLDispatcher
 from utils import bench, init_dist, inplace_unique
