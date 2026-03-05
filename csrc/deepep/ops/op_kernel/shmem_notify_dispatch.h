@@ -7,6 +7,7 @@
 #include "shmem_api.h"
 #include "comm_args.h"
 #include "data_copy.h"
+#include "shmem_sync_flag.h"
 
 using namespace AscendC;
 using namespace Moe;
@@ -34,6 +35,9 @@ class ShmemNotifyDispatch
     constexpr static uint64_t WIN_MAGIC_OFFSET = 100UL * 1024UL;  // notify(50kb) + dispatch&combine(50kb)
     constexpr static uint64_t HALF_WIN_STATE_OFFSET =
         8 * 1024UL * 1024UL;  // notify(2MB) + dispatch(3MB) + combine(3MB)
+
+    constexpr static int32_t PHASE_ENTRY = 1;  // kernel entered, input tensors ready
+    constexpr static int32_t PHASE_DONE  = 2;  // compute/DMA complete, output tensors finalized
 
     constexpr static int UB_ALIGN_SIZE = 32;
     constexpr static int64_t MAX_RANK_PER_CORE = 8;
@@ -87,14 +91,28 @@ public:
         recvCntGt.SetGlobalBuffer((__gm__ int32_t *)allRecvCount_);
 
         pipe_.InitBuffer(tBuf, UB_FLAG_SIZE);
+
+        // Init ShmemSyncFlag — per-core granularity (slotsPerRank = blockNum)
+        syncFlag_.Init(gva_gm, static_cast<uint32_t>(epRankId_),
+                       static_cast<uint32_t>(epWorldSize_),
+                       static_cast<uint32_t>(blockNum_), tBuf);
     }
 
     __aicore__ inline void Process()
     {
+        // ====== Notify Sync Protocol (magic = M) ======
+        // Step 1: IncrementMagic — get magic M
+        syncFlag_.IncrementMagic();
+
+        // Step 2: BarrierAll — ensure all ranks have entered and input is ready
+        //         tokenPerExpertData readable on all ranks after barrier
+        syncFlag_.BarrierAll();
+
+        // Step 4: AllGather each rank's tokenPerExpertData (cross-rank read)
         AllGatherSendData();  // allgather 每个rank的sendCount
         SyncAll<true>();
-        // shmem_barrier_all();  // 全卡同步，确保数据已经获取完
 
+        // Step 5: Post-processing (local compute, no cross-rank dependency)
         ReloadRecvData();
         int32_t remainBlockIdx = (blockNum_ / 2);
         BuildTotalRecvCount();
@@ -108,9 +126,11 @@ public:
         SyncAll<true>();
     }
 
+    __aicore__ inline ShmemSyncFlagImpl::ShmemSyncFlag &GetSyncFlag() { return syncFlag_; }
+
 private:
     __aicore__ inline GM_ADDR GetWindStateAddrByRankId(const int32_t rankId);
-    __aicore__ inline uint64_t GetMagicValue(void);
+    // __aicore__ inline uint64_t GetMagicValue(void);
     template <typename F>
     __aicore__ inline void SetAtomic(int op);
     __aicore__ inline void UnsetAtomic(int op);
@@ -162,6 +182,7 @@ private:
 
     TPipe pipe_;
     TBuf<QuePosition::VECCALC> tBuf;
+    ShmemSyncFlagImpl::ShmemSyncFlag syncFlag_;
     TBuf<> tokenPerExpertDataBuf_;
     TBuf<> sendCountBuf_;
     TBuf<> recvDataBuf_;
@@ -397,73 +418,73 @@ private:
     }
 
     // 分核向对应rank发送flag
-    __aicore__ inline void SetShmemFlag()
-    {
-        __ubuf__ uint64_t *inputUB = (__ubuf__ uint64_t *)get_imm(0);
-        int64_t copyOffset = blockIdx_ * rankNumPerCore;  // 16个rank 每个核负责一个rank
-        copyLen = epWorldSize_ - copyOffset < rankNumPerCore ? epWorldSize_ - copyOffset : rankNumPerCore;
-        if (copyLen > 0) {
-            uint64_t v = MergeMagicWithValue(magic, 1);
-            *inputUB = v;
-            AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
-            AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
-            for (int i = copyOffset; i < copyOffset + copyLen; ++i) {
-                GM_ADDR remote_state = GetWindStateAddrByRankId(i);
+    // __aicore__ inline void SetShmemFlag()
+    // {
+    //     __ubuf__ uint64_t *inputUB = (__ubuf__ uint64_t *)get_imm(0);
+    //     int64_t copyOffset = blockIdx_ * rankNumPerCore;  // 16个rank 每个核负责一个rank
+    //     copyLen = epWorldSize_ - copyOffset < rankNumPerCore ? epWorldSize_ - copyOffset : rankNumPerCore;
+    //     if (copyLen > 0) {
+    //         uint64_t v = MergeMagicWithValue(magic, 1);
+    //         *inputUB = v;
+    //         AscendC::SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    //         AscendC::WaitFlag<HardEvent::S_MTE3>(EVENT_ID0);
+    //         for (int i = copyOffset; i < copyOffset + copyLen; ++i) {
+    //             GM_ADDR remote_state = GetWindStateAddrByRankId(i);
+    //
+    //             CpUB2GM((__gm__ uint64_t *)(remote_state) + epRankId_ * FLAG_UNIT_INT_NUM, inputUB, sizeof(uint64_t));
+    //         }
+    //         pipe_barrier(PIPE_ALL);
+    //     }
+    // }
 
-                CpUB2GM((__gm__ uint64_t *)(remote_state) + epRankId_ * FLAG_UNIT_INT_NUM, inputUB, sizeof(uint64_t));
-            }
-            pipe_barrier(PIPE_ALL);
-        }
-    }
+    // __aicore__ inline uint64_t MergeMagicWithValue(uint64_t magic, uint64_t value)
+    // {
+    //     // magic as the high part, eventID as the low part, combined into a value for comparison
+    //     return (magic * 2ULL + value);
+    // }
 
-    __aicore__ inline uint64_t MergeMagicWithValue(uint64_t magic, uint64_t value)
-    {
-        // magic as the high part, eventID as the low part, combined into a value for comparison
-        return (magic * 2ULL + value);
-    }
+    // // Wait for a part of synchronization flags within a epRankId_
+    // __aicore__ inline void WaitOneRankPartFlag(__gm__ uint64_t *waitAddr, int64_t flagNum, uint64_t checkValue)
+    // {
+    //     GlobalTensor<uint64_t> globalWait;
+    //     globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
+    //     LocalTensor<uint64_t> localWait = tBuf.GetWithOffset<uint64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
+    //     bool isSync = true;
+    //     uint64_t checkedFlagNum = 0;
+    //     do {
+    //         // Copy global synchronization flags to local
+    //         DataCopy(localWait, globalWait[checkedFlagNum * FLAG_UNIT_INT_NUM],
+    //                  (flagNum - checkedFlagNum) * FLAG_UNIT_INT_NUM);
+    //         AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
+    //         AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);  // Wait for GM->UB
+    //
+    //         // Check if the synchronization flags are equal to checkValue
+    //         isSync = true;
+    //         uint64_t remainToCheck = flagNum - checkedFlagNum;
+    //         for (auto i = 0; i < remainToCheck; ++i) {
+    //             // Continue waiting if any core has not reached the checkValue phase
+    //             uint64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
+    //             if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
+    //                 isSync = false;
+    //                 checkedFlagNum += i;
+    //                 break;
+    //             }
+    //         }
+    //     } while (!isSync);
+    // }
 
-    // Wait for a part of synchronization flags within a epRankId_
-    __aicore__ inline void WaitOneRankPartFlag(__gm__ uint64_t *waitAddr, int64_t flagNum, uint64_t checkValue)
-    {
-        GlobalTensor<uint64_t> globalWait;
-        globalWait.SetGlobalBuffer(waitAddr, flagNum * FLAG_UNIT_INT_NUM);
-        LocalTensor<uint64_t> localWait = tBuf.GetWithOffset<uint64_t>(flagNum * FLAG_UNIT_INT_NUM, 0);
-        bool isSync = true;
-        uint64_t checkedFlagNum = 0;
-        do {
-            // Copy global synchronization flags to local
-            DataCopy(localWait, globalWait[checkedFlagNum * FLAG_UNIT_INT_NUM],
-                     (flagNum - checkedFlagNum) * FLAG_UNIT_INT_NUM);
-            AscendC::SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-            AscendC::WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);  // Wait for GM->UB
-
-            // Check if the synchronization flags are equal to checkValue
-            isSync = true;
-            uint64_t remainToCheck = flagNum - checkedFlagNum;
-            for (auto i = 0; i < remainToCheck; ++i) {
-                // Continue waiting if any core has not reached the checkValue phase
-                uint64_t v = localWait.GetValue(i * FLAG_UNIT_INT_NUM);
-                if ((v & MAGIC_MASK) != (checkValue & MAGIC_MASK) || v < checkValue) {
-                    isSync = false;
-                    checkedFlagNum += i;
-                    break;
-                }
-            }
-        } while (!isSync);
-    }
-
-    /**
-     * @brief Wait for the flags starting from the specified eventID on the specified card to become
-     *        a value composed of the combination of magic and value.<br>
-     *        Note: [eventID, eventID + flagNum)
-     */
-    __aicore__ inline void WaitShmemFlag(uint64_t magic, uint64_t value, uint64_t eventID, int32_t epRankId_,
-                                         int64_t flagNum)
-    {
-        uint64_t v = MergeMagicWithValue(magic, value);
-        GM_ADDR remote_state = GetWindStateAddrByRankId(epRankId_);
-        WaitOneRankPartFlag((__gm__ uint64_t *)(remote_state) + eventID * FLAG_UNIT_INT_NUM, flagNum, v);
-    }
+    // /**
+    //  * @brief Wait for the flags starting from the specified eventID on the specified card to become
+    //  *        a value composed of the combination of magic and value.<br>
+    //  *        Note: [eventID, eventID + flagNum)
+    //  */
+    // __aicore__ inline void WaitShmemFlag(uint64_t magic, uint64_t value, uint64_t eventID, int32_t epRankId_,
+    //                                      int64_t flagNum)
+    // {
+    //     uint64_t v = MergeMagicWithValue(magic, value);
+    //     GM_ADDR remote_state = GetWindStateAddrByRankId(epRankId_);
+    //     WaitOneRankPartFlag((__gm__ uint64_t *)(remote_state) + eventID * FLAG_UNIT_INT_NUM, flagNum, v);
+    // }
 };
 template <typename T>
 __aicore__ inline GM_ADDR ShmemNotifyDispatch<T>::GetWindStateAddrByRankId(const int32_t rankId)
@@ -473,23 +494,23 @@ __aicore__ inline GM_ADDR ShmemNotifyDispatch<T>::GetWindStateAddrByRankId(const
     return (GM_ADDR)(ptr) + WIN_MAGIC_OFFSET + bufferId_ * HALF_WIN_STATE_OFFSET;
 }
 
-// Assign values to gva_gm and blockIdx_ before calling, magic buffer 24kb
-template <typename T>
-__aicore__ inline uint64_t ShmemNotifyDispatch<T>::GetMagicValue(void)
-{
-    uint64_t magic = 0;
-    GlobalTensor<uint64_t> selfDataStatusTensor;
-    GM_ADDR statusDataSpaceGm = (GM_ADDR)(gva_gm);
-    selfDataStatusTensor.SetGlobalBuffer((__gm__ uint64_t *)(statusDataSpaceGm));
-    DataCacheCleanAndInvalid<uint64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
-        selfDataStatusTensor[blockIdx_ * UB_ALIGN_SIZE]);
-    magic = selfDataStatusTensor(blockIdx_ * UB_ALIGN_SIZE);
-    if (magic <= 0) {
-        magic = 1;
-    }
-    selfDataStatusTensor(blockIdx_ * UB_ALIGN_SIZE) = magic + 1;
-    return magic;
-}
+// // Assign values to gva_gm and blockIdx_ before calling, magic buffer 24kb
+// template <typename T>
+// __aicore__ inline uint64_t ShmemNotifyDispatch<T>::GetMagicValue(void)
+// {
+//     uint64_t magic = 0;
+//     GlobalTensor<uint64_t> selfDataStatusTensor;
+//     GM_ADDR statusDataSpaceGm = (GM_ADDR)(gva_gm);
+//     selfDataStatusTensor.SetGlobalBuffer((__gm__ uint64_t *)(statusDataSpaceGm));
+//     DataCacheCleanAndInvalid<uint64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(
+//         selfDataStatusTensor[blockIdx_ * UB_ALIGN_SIZE]);
+//     magic = selfDataStatusTensor(blockIdx_ * UB_ALIGN_SIZE);
+//     if (magic <= 0) {
+//         magic = 1;
+//     }
+//     selfDataStatusTensor(blockIdx_ * UB_ALIGN_SIZE) = magic + 1;
+//     return magic;
+// }
 
 /**
  * @brief Copy data from GM to GM with ping-pong method.

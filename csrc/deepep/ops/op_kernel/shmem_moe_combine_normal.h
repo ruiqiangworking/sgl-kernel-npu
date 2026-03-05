@@ -5,6 +5,7 @@
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "shmem_moe_combine_normal_tiling.h"
+#include "shmem_sync_flag.h"
 
 namespace ShmemMoeCombineNormalImpl {
 constexpr uint64_t NOTIFY_MAGIC_OFFSET = 50UL * 1024UL;
@@ -37,6 +38,9 @@ template <TemplateMC2TypeClass>
 class ShmemMoeCombineNormal
 {
 public:
+    constexpr static int32_t PHASE_ENTRY = 1;  // kernel entered, input tensors ready
+    constexpr static int32_t PHASE_DONE  = 2;  // compute/DMA complete, output tensors finalized
+
     __aicore__ inline ShmemMoeCombineNormal(){};
     __aicore__ inline void Init(GM_ADDR recvX, GM_ADDR epRecvCount, GM_ADDR topkWeights, GM_ADDR topkIdx,
                                 GM_ADDR sendTokenIdx, GM_ADDR XOut, GM_ADDR sendCostStatsOut, GM_ADDR workspaceGM,
@@ -49,14 +53,14 @@ private:
                                             GM_ADDR sendTokenIdx, GM_ADDR XOut, GM_ADDR sendCostStatsOut);
     __aicore__ inline void InitTilingData(const ShmemMoeCombineNormalTilingData *tilingData);
     __aicore__ inline void InitBuffLen();
-    __aicore__ inline void CopyBufferToShareAndSetStatus();
-    __aicore__ inline void CopyBufferToShare(uint32_t srcRankId, uint32_t srcTokenId, uint32_t srcTopkId,
-                                             uint32_t tkIndex);
+    // __aicore__ inline void CopyBufferToShareAndSetStatus();
+    // __aicore__ inline void CopyBufferToShare(uint32_t srcRankId, uint32_t srcTokenId, uint32_t srcTopkId,
+    //                                          uint32_t tkIndex);
     __aicore__ inline void ReadBufferFromRemote();
-    __aicore__ inline void WaitBuffCopy(uint32_t tokenIndex);
-    __aicore__ inline void SetStatusBySrcInfo(uint32_t srcRankId, uint32_t srcTokenId, uint32_t srcTopkId);
+    // __aicore__ inline void WaitBuffCopy(uint32_t tokenIndex);
+    // __aicore__ inline void SetStatusBySrcInfo(uint32_t srcRankId, uint32_t srcTokenId, uint32_t srcTopkId);
     __aicore__ inline void ReadBufferAndWeightedSum(uint32_t tokenIndex, uint32_t startTokenIndex);
-    __aicore__ inline void AllGatherRecvCount();
+    // __aicore__ inline void AllGatherRecvCount();
 
     __aicore__ inline void SplitCoreCal(uint32_t totalNum, uint32_t &perCoreNum, uint32_t &startIdx, uint32_t &endIdx)
     {
@@ -134,6 +138,9 @@ private:
     GM_ADDR metaDataGvaGM_;
     GM_ADDR metaStateGvaGM_;
     GM_ADDR dataStateGvaGM_;
+
+    TBuf<QuePosition::VECCALC> syncFlagBuf_;
+    ShmemSyncFlagImpl::ShmemSyncFlag syncFlag_;
 
     LocalTensor<float> tokenFloatLocal;
     LocalTensor<float> weightedMulBufLocal;
@@ -230,6 +237,10 @@ __aicore__ inline void ShmemMoeCombineNormal<TemplateMC2TypeFunc>::Init(
     dataStateWinOffset_ = metaStateWinOffset_ + magic_ * COMBINE_WIN_STATE_OFFSET;
     metaStateGvaGM_ = (GM_ADDR)(metaDataGvaGM_ + metaStateWinOffset_);
     dataStateGvaGM_ = (GM_ADDR)(metaDataGvaGM_ + dataStateWinOffset_);
+
+    // Init ShmemSyncFlag — per-core granularity (slotsPerRank = aivNum)
+    tpipe_->InitBuffer(syncFlagBuf_, ShmemSyncFlagImpl::FLAG_SLOT_SIZE);
+    syncFlag_.Init(metaDataGvaGM_, epRankId_, epWorldSize_, aivNum_, syncFlagBuf_);
 }
 
 template <TemplateMC2TypeClass>
@@ -332,9 +343,18 @@ template <TemplateMC2TypeClass>
 __aicore__ inline void ShmemMoeCombineNormal<TemplateMC2TypeFunc>::Process()
 {
     if ASCEND_IS_AIV {  // 全aiv处理
+        // ====== Combine Sync Protocol (magic = M+2) ======
+        // Step 1: IncrementMagic — get magic M+2
+        syncFlag_.IncrementMagic();
+
+        // Step 2: BarrierAll — ensures every rank's GMM is complete.
+        //         Combine entering means GMM has finished on this rank; barrier
+        //         guarantees all remote GMM outputs are ready to read.
+        syncFlag_.BarrierAll();
+
+        // Step 3: Read remote data and compute weighted sum
         ReadBufferFromRemote();
         SyncAll<true>();
-        // shmem_barrier_all();  // 全卡同步，确保数据已经获取完
     }
 }
 

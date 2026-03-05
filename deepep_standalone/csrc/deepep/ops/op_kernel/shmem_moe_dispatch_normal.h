@@ -5,6 +5,7 @@
 #include "kernel_operator.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "shmem_moe_dispatch_normal_tiling.h"
+#include "shmem_sync_flag.h"
 
 namespace ShmemMoeDispatchNormalImpl {
 constexpr uint8_t BUFFER_NUM = 2;
@@ -40,6 +41,9 @@ template <CamTypeClass>
 class ShmemMoeDispatchNormal
 {
 public:
+    constexpr static int32_t PHASE_ENTRY = 1;  // kernel entered, input tensors ready
+    constexpr static int32_t PHASE_DONE  = 2;  // compute/DMA complete, output tensors finalized
+
     __aicore__ inline ShmemMoeDispatchNormal(){};
     __aicore__ inline void Init(GM_ADDR x, GM_ADDR expertIds, GM_ADDR send_tokenIdx, GM_ADDR put_offset,
                                 GM_ADDR expandXOut, GM_ADDR dynamicScalesOut, GM_ADDR expandIdxOut,
@@ -49,8 +53,8 @@ public:
 
 private:
     __aicore__ inline void InputToDstOutput();
-    __aicore__ inline void SetShmemStatus();
-    __aicore__ inline void WaitShmemStatus();
+    // __aicore__ inline void SetShmemStatus();
+    // __aicore__ inline void WaitShmemStatus();
     __aicore__ inline void QuantInit();
     __aicore__ inline void ReduceMaxInplace(const LocalTensor<float> &srcLocal, uint32_t count);
     __aicore__ inline void QuantProcess();
@@ -128,6 +132,8 @@ private:
 
     GM_ADDR gva_gm;
     GM_ADDR shareRecvDataAddrs[8];  // List of shmem asymmetric output addresses ()
+    TBuf<QuePosition::VECCALC> syncFlagBuf_;
+    ShmemSyncFlagImpl::ShmemSyncFlag syncFlag_;
 };
 
 template <CamTypeClass>
@@ -178,6 +184,10 @@ __aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::Init(GM_ADDR x, GM_A
     putOffsetAlignSize = Ceil(epRankSize * moeExpertNum * sizeof(int32_t), UB_ALIGN) * UB_ALIGN;  // 4 * ranks * moeNum
     tpipe_->InitBuffer(putOffsetBuf, putOffsetAlignSize);
     putOffsetTensor = putOffsetBuf.Get<int32_t>();
+
+    // Init ShmemSyncFlag — per-core granularity (slotsPerRank = blockNum)
+    tpipe_->InitBuffer(syncFlagBuf_, ShmemSyncFlagImpl::FLAG_SLOT_SIZE);
+    syncFlag_.Init(gva_gm, epRankId, epRankSize, blockNum, syncFlagBuf_);
 }
 
 template <CamTypeClass>
@@ -335,113 +345,116 @@ __aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::InputToDstOutput()
     }
 }
 
-template <CamTypeClass>
-__aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::SetShmemStatus()
-{
-    // 给每卡发送一个flag
-    uint32_t startRankId, endRankId, rankNumPerCore, remainRanks;
-    rankNumPerCore = epRankSize / blockNum;
-    remainRanks = epRankSize % blockNum;
-    startRankId = rankNumPerCore * blockIdx;
-    if (blockIdx < remainRanks) {
-        rankNumPerCore += 1;
-        startRankId += blockIdx;
-    } else {
-        startRankId += remainRanks;
-    }
-    endRankId = startRankId + rankNumPerCore;
-    if (startRankId >= epRankSize) {
-        return;
-    }
+// template <CamTypeClass>
+// __aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::SetShmemStatus()
+// {
+//     // 给每卡发送一个flag
+//     uint32_t startRankId, endRankId, rankNumPerCore, remainRanks;
+//     rankNumPerCore = epRankSize / blockNum;
+//     remainRanks = epRankSize % blockNum;
+//     startRankId = rankNumPerCore * blockIdx;
+//     if (blockIdx < remainRanks) {
+//         rankNumPerCore += 1;
+//         startRankId += blockIdx;
+//     } else {
+//         startRankId += remainRanks;
+//     }
+//     endRankId = startRankId + rankNumPerCore;
+//     if (startRankId >= epRankSize) {
+//         return;
+//     }
+//
+//     tpipe_->InitBuffer(statusBuf, UB_ALIGN);
+//     statusTensor = statusBuf.Get<int32_t>();
+//     Duplicate<int32_t>(statusTensor, 0x3F800000, FLOAT_NUM_PER_ALIGN);
+//     PipeBarrier<PIPE_V>();
+//
+//     for (uint32_t i = startRankId; i < endRankId; ++i) {
+//         GM_ADDR remoteState = GetWindStateAddrByRankId(i) + epRankId * STATE_OFFSET;
+//
+//         dstStatusGT.SetGlobalBuffer((__gm__ int32_t *)remoteState);
+//         DataCopy<int32_t>(dstStatusGT, statusTensor, 8UL);
+//     }
+//     SyncFunc<AscendC::HardEvent::MTE3_S>();
+// }
 
-    tpipe_->InitBuffer(statusBuf, UB_ALIGN);
-    statusTensor = statusBuf.Get<int32_t>();
-    Duplicate<int32_t>(statusTensor, 0x3F800000, FLOAT_NUM_PER_ALIGN);
-    PipeBarrier<PIPE_V>();
-
-    for (uint32_t i = startRankId; i < endRankId; ++i) {
-        GM_ADDR remoteState = GetWindStateAddrByRankId(i) + epRankId * STATE_OFFSET;
-
-        dstStatusGT.SetGlobalBuffer((__gm__ int32_t *)remoteState);
-        DataCopy<int32_t>(dstStatusGT, statusTensor, 8UL);
-    }
-    SyncFunc<AscendC::HardEvent::MTE3_S>();
-}
-
-template <CamTypeClass>
-__aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::WaitShmemStatus()
-{
-    tpipe_->Reset();
-    uint32_t startRankId, endRankId, rankNumPerCore, remainRanks;
-    rankNumPerCore = epRankSize / blockNum;
-    remainRanks = epRankSize % blockNum;
-    startRankId = rankNumPerCore * blockIdx;
-    if (blockIdx < remainRanks) {
-        rankNumPerCore += 1;
-        startRankId += blockIdx;
-    } else {
-        startRankId += remainRanks;
-    }
-    endRankId = startRankId + rankNumPerCore;
-    if (startRankId >= epRankSize) {
-        SyncAll<true>();
-        return;
-    }
-
-    uint32_t waitStatusBufSize = (((rankNumPerCore * UB_ALIGN) > 256) ? (rankNumPerCore * UB_ALIGN) : 256);
-    tpipe_->InitBuffer(waitStatusBuf, waitStatusBufSize);  // ranks/48 * 32B = 1 * 32B
-    tpipe_->InitBuffer(scalarBuf, UB_ALIGN * 3);           // 96B
-
-    LocalTensor<float> gatherMaskOutTensor = gatherMaskOutBuf.Get<float>();
-    LocalTensor<float> statusSumOutTensor = scalarBuf.GetWithOffset<float>(UB_ALIGN / sizeof(float), UB_ALIGN);
-    LocalTensor<float> statusFp32Tensor = waitStatusBuf.Get<float>();
-    GlobalTensor<float> windowInstatusFp32Tensor;
-    windowInstatusFp32Tensor.SetGlobalBuffer((__gm__ float *)GetWindStateAddrByRankId(epRankId));
-    uint32_t mask = 1;
-    float compareTarget = static_cast<float>(1.0) * rankNumPerCore;
-    float sumOfFlag = static_cast<float>(-1.0);
-    DataCopyParams intriParams{static_cast<uint16_t>(rankNumPerCore), 1, 0, 0};
-
-    // uint64_t timeoutCheckStart = static_cast<uint64_t>(GetSystemCycle());
-    // uint64_t timeoutCheckEnd, timeoutCheckDuration;
-    SyncFunc<AscendC::HardEvent::S_V>();
-    while (sumOfFlag != compareTarget) {
-        DataCopy(statusFp32Tensor, windowInstatusFp32Tensor[startRankId * STATE_OFFSET / sizeof(float)], intriParams);
-        SyncFunc<AscendC::HardEvent::MTE2_V>();
-        ReduceSum(statusSumOutTensor, statusFp32Tensor, gatherMaskOutTensor, mask, rankNumPerCore, 1);
-        SyncFunc<AscendC::HardEvent::V_S>();
-        sumOfFlag = statusSumOutTensor.GetValue(0);
-
-        // timeoutCheckEnd = static_cast<uint64_t>(GetSystemCycle());
-        // timeoutCheckDuration = (timeoutCheckEnd - timeoutCheckStart) / CYCLE_TO_TIME;
-        // if (timeoutCheckDuration > TIMEOUT_DETECTION_THRESHOLD) {
-        // printf("[normal_dispatch] WaitShmemStatus, rank:%d, coreId:%d, compareTarget:%d, sumOfFlag:%d\n",
-        //     epRankId, blockIdx, compareTarget, sumOfFlag);
-        // }
-    }
-
-    // 清状态
-    SyncFunc<AscendC::HardEvent::MTE3_S>();
-    DataCopyParams intriOutParams{static_cast<uint16_t>(rankNumPerCore), 1, 0, 0};
-    uint64_t duplicateMask[2] = {0x101010101010101, 0};
-    LocalTensor<int32_t> cleanStateTensor = waitStatusBuf.Get<int32_t>();
-    SyncFunc<AscendC::HardEvent::S_V>();
-    Duplicate<int32_t>(cleanStateTensor, 0, duplicateMask, Ceil(rankNumPerCore, 8), 1, 8);
-    SyncFunc<AscendC::HardEvent::V_MTE3>();
-    DataCopy(windowInstatusFp32Tensor[startRankId * STATE_OFFSET / sizeof(float)],
-             cleanStateTensor.ReinterpretCast<float>(), intriOutParams);
-    SyncFunc<AscendC::HardEvent::MTE3_S>();
-
-    SyncAll<true>();
-}
+// template <CamTypeClass>
+// __aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::WaitShmemStatus()
+// {
+//     tpipe_->Reset();
+//     uint32_t startRankId, endRankId, rankNumPerCore, remainRanks;
+//     rankNumPerCore = epRankSize / blockNum;
+//     remainRanks = epRankSize % blockNum;
+//     startRankId = rankNumPerCore * blockIdx;
+//     if (blockIdx < remainRanks) {
+//         rankNumPerCore += 1;
+//         startRankId += blockIdx;
+//     } else {
+//         startRankId += remainRanks;
+//     }
+//     endRankId = startRankId + rankNumPerCore;
+//     if (startRankId >= epRankSize) {
+//         SyncAll<true>();
+//         return;
+//     }
+//
+//     uint32_t waitStatusBufSize = (((rankNumPerCore * UB_ALIGN) > 256) ? (rankNumPerCore * UB_ALIGN) : 256);
+//     tpipe_->InitBuffer(waitStatusBuf, waitStatusBufSize);  // ranks/48 * 32B = 1 * 32B
+//     tpipe_->InitBuffer(scalarBuf, UB_ALIGN * 3);           // 96B
+//
+//     LocalTensor<float> gatherMaskOutTensor = gatherMaskOutBuf.Get<float>();
+//     LocalTensor<float> statusSumOutTensor = scalarBuf.GetWithOffset<float>(UB_ALIGN / sizeof(float), UB_ALIGN);
+//     LocalTensor<float> statusFp32Tensor = waitStatusBuf.Get<float>();
+//     GlobalTensor<float> windowInstatusFp32Tensor;
+//     windowInstatusFp32Tensor.SetGlobalBuffer((__gm__ float *)GetWindStateAddrByRankId(epRankId));
+//     uint32_t mask = 1;
+//     float compareTarget = static_cast<float>(1.0) * rankNumPerCore;
+//     float sumOfFlag = static_cast<float>(-1.0);
+//     DataCopyParams intriParams{static_cast<uint16_t>(rankNumPerCore), 1, 0, 0};
+//
+//     SyncFunc<AscendC::HardEvent::S_V>();
+//     while (sumOfFlag != compareTarget) {
+//         DataCopy(statusFp32Tensor, windowInstatusFp32Tensor[startRankId * STATE_OFFSET / sizeof(float)], intriParams);
+//         SyncFunc<AscendC::HardEvent::MTE2_V>();
+//         ReduceSum(statusSumOutTensor, statusFp32Tensor, gatherMaskOutTensor, mask, rankNumPerCore, 1);
+//         SyncFunc<AscendC::HardEvent::V_S>();
+//         sumOfFlag = statusSumOutTensor.GetValue(0);
+//     }
+//
+//     // 清状态
+//     SyncFunc<AscendC::HardEvent::MTE3_S>();
+//     DataCopyParams intriOutParams{static_cast<uint16_t>(rankNumPerCore), 1, 0, 0};
+//     uint64_t duplicateMask[2] = {0x101010101010101, 0};
+//     LocalTensor<int32_t> cleanStateTensor = waitStatusBuf.Get<int32_t>();
+//     SyncFunc<AscendC::HardEvent::S_V>();
+//     Duplicate<int32_t>(cleanStateTensor, 0, duplicateMask, Ceil(rankNumPerCore, 8), 1, 8);
+//     SyncFunc<AscendC::HardEvent::V_MTE3>();
+//     DataCopy(windowInstatusFp32Tensor[startRankId * STATE_OFFSET / sizeof(float)],
+//              cleanStateTensor.ReinterpretCast<float>(), intriOutParams);
+//     SyncFunc<AscendC::HardEvent::MTE3_S>();
+//
+//     SyncAll<true>();
+// }
 
 template <CamTypeClass>
 __aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::Process()
 {
     if ASCEND_IS_AIV {
+        // ====== Dispatch Sync Protocol (magic = M+1) ======
+        // Step 1: IncrementMagic — get magic M+1
+        syncFlag_.IncrementMagic();
+
+        // Step 2: BarrierAll — ensure Notify results are visible on all ranks
+        //         (putOffset, recvData etc. computed by Notify must be committed)
+        syncFlag_.BarrierAll();
+
+        // Step 3: Write token data to remote ranks via shmem
         InputToDstOutput();
-        SyncAll<true>();
-        // shmem_barrier_all();  // 全卡同步，确保数据已经获取完
+
+        // Step 4: BarrierAll — guarantee all ranks have finished writing
+        //         (all remote ranks have finished writing to this rank's expandXOut)
+        //         so that the subsequent GMM kernel can safely consume it.
+        syncFlag_.BarrierAll();
     }
 }
 
