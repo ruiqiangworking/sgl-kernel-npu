@@ -46,6 +46,24 @@ private:
 
     bool available = false;
 
+    // Tensor caches for intranode_dispatch (fixed-shape, non-returned intermediates)
+    at::Tensor c_dispatch_total_recv_token;            // {1}, kInt
+    at::Tensor c_dispatch_max_bs;                      // {1}, kInt
+    at::Tensor c_dispatch_recv_tokens_per_expert;      // {num_local_experts}, kLong
+    // shmem path non-returned placeholders (not use)
+    at::Tensor c_dispatch_shmem_send_data;             // {1}, kInt
+    at::Tensor c_dispatch_shmem_send_data_offset;      // {1}, kInt
+    at::Tensor c_dispatch_shmem_recv_offset;           // {1}, kInt
+    at::Tensor c_dispatch_shmem_recv_data;             // {num_ranks, num_experts}, kInt (shmem)
+    // cam path non-returned intermediates
+    at::Tensor c_dispatch_cam_send_data;               // {num_experts * 3}, kInt
+    at::Tensor c_dispatch_cam_send_data_offset;        // {num_experts}, kInt
+    at::Tensor c_dispatch_cam_recv_data;               // {num_experts * 3}, kInt
+    at::Tensor c_dispatch_cam_recv_offset;             // {num_experts}, kInt
+    // Tensor cache for intranode_combine
+    at::Tensor c_combine_tp_send_counts;               // {1}, kInt
+    at::Tensor c_combine_shmem_x;                      // {num_recv_tokens, hidden}, shmem
+
 public:
     Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode,
            std::string moe_all_to_all_group_name);

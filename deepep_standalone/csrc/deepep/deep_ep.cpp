@@ -338,16 +338,41 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
         // get shmem_ptr_info
         ext_info = (int64_t)shmem_ptr;
 
-        recv_data = create_tensor_from_shmem(std::vector<int64_t>{num_ranks, num_experts}, at::kInt, device);
+        if (!c_dispatch_shmem_recv_data.defined() ||
+            c_dispatch_shmem_recv_data.size(0) != num_ranks ||
+            c_dispatch_shmem_recv_data.size(1) != num_experts) {
+            c_dispatch_shmem_recv_data = create_tensor_from_shmem(
+                std::vector<int64_t>{num_ranks, num_experts}, at::kInt, device);
+        }
+        recv_data = c_dispatch_shmem_recv_data;
         put_offset_ = torch::empty({num_experts, num_ranks}, at::dtype(at::kInt).device(device));
-        total_recv_token_ = torch::empty({1}, at::dtype(at::kInt).device(device));
-        max_bs_ = torch::empty({1}, at::dtype(at::kInt).device(device));
-        recv_tokens_per_expert_ = torch::empty({num_local_experts}, at::dtype(at::kLong).device(device));
+        if (!c_dispatch_total_recv_token.defined()) {
+            c_dispatch_total_recv_token = torch::empty({1}, at::dtype(at::kInt).device(device));
+        }
+        if (!c_dispatch_max_bs.defined()) {
+            c_dispatch_max_bs = torch::empty({1}, at::dtype(at::kInt).device(device));
+        }
+        if (!c_dispatch_recv_tokens_per_expert.defined() ||
+            c_dispatch_recv_tokens_per_expert.size(0) != num_local_experts) {
+            c_dispatch_recv_tokens_per_expert = torch::empty({num_local_experts}, at::dtype(at::kLong).device(device));
+        }
+        total_recv_token_ = c_dispatch_total_recv_token;
+        max_bs_ = c_dispatch_max_bs;
+        recv_tokens_per_expert_ = c_dispatch_recv_tokens_per_expert;
 
-        send_data = torch::empty({1}, at::dtype(at::kInt).device(device));         // not use
-        send_data_offset = torch::empty({1}, at::dtype(at::kInt).device(device));  // not use
-        recv_count_ = torch::empty({1}, at::dtype(at::kInt).device(device));       // not use
-        recv_offset_ = torch::empty({1}, at::dtype(at::kInt).device(device));      // not use
+        if (!c_dispatch_shmem_send_data.defined()) {
+            c_dispatch_shmem_send_data = torch::empty({1}, at::dtype(at::kInt).device(device));
+        }
+        if (!c_dispatch_shmem_send_data_offset.defined()) {
+            c_dispatch_shmem_send_data_offset = torch::empty({1}, at::dtype(at::kInt).device(device));
+        }
+        recv_count_ = torch::empty({1}, at::dtype(at::kInt).device(device));       // not use, returned as dummy
+        if (!c_dispatch_shmem_recv_offset.defined()) {
+            c_dispatch_shmem_recv_offset = torch::empty({1}, at::dtype(at::kInt).device(device));
+        }
+        send_data = c_dispatch_shmem_send_data;                                    // not use
+        send_data_offset = c_dispatch_shmem_send_data_offset;                      // not use
+        recv_offset_ = c_dispatch_shmem_recv_offset;                               // not use
 
         EXEC_NPU_CMD(aclnnShmemNotifyDispatch, new_num_tokens_per_expert, send_count,
                      num_ranks,  // rankSize
@@ -359,7 +384,6 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
         int trt = total_recv_token_.item<int>();
         int num_recv_tokens = (trt == 0) ? 1 : trt;  // max recv_tokens in all rank
 
-        recv_data.reset();  // release symmetric tensor
         expandx_out =
             use_quant
                 ? create_tensor_from_shmem(std::vector<int64_t>{num_recv_tokens, hidden}, at::kChar, device)
@@ -384,15 +408,38 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
         send_per_group = 3;  // (send_to_expert_num, send_to_expert_offset, send_rank_tokens)
         send_count = send_per_group * num_local_experts * num_ranks;
 
-        send_data = torch::empty({num_experts * send_per_group}, at::dtype(at::kInt).device(x.device()));
-        send_data_offset = torch::empty({num_experts}, at::dtype(at::kInt).device(x.device()));
-        recv_data = torch::empty({num_experts * send_per_group}, at::dtype(at::kInt).device(x.device()));
-        total_recv_token_ = torch::empty({1}, at::dtype(at::kInt).device(x.device()));
-        recv_count_ = torch::empty({num_experts}, at::dtype(at::kInt).device(x.device()));
-        recv_offset_ = torch::empty({num_experts}, at::dtype(at::kInt).device(x.device()));
-        max_bs_ = torch::empty({1}, at::dtype(at::kInt).device(x.device()));
-        recv_tokens_per_expert_ = torch::empty({num_local_experts}, at::dtype(at::kLong).device(x.device()));
-        put_offset_ = torch::empty({1}, at::dtype(at::kInt).device(x.device()));  // not use
+        int64_t cam_send_data_size = num_experts * send_per_group;
+        if (!c_dispatch_cam_send_data.defined() || c_dispatch_cam_send_data.numel() != cam_send_data_size) {
+            c_dispatch_cam_send_data = torch::empty({cam_send_data_size}, at::dtype(at::kInt).device(x.device()));
+        }
+        if (!c_dispatch_cam_send_data_offset.defined() || c_dispatch_cam_send_data_offset.numel() != num_experts) {
+            c_dispatch_cam_send_data_offset = torch::empty({num_experts}, at::dtype(at::kInt).device(x.device()));
+        }
+        if (!c_dispatch_cam_recv_data.defined() || c_dispatch_cam_recv_data.numel() != cam_send_data_size) {
+            c_dispatch_cam_recv_data = torch::empty({cam_send_data_size}, at::dtype(at::kInt).device(x.device()));
+        }
+        if (!c_dispatch_total_recv_token.defined()) {
+            c_dispatch_total_recv_token = torch::empty({1}, at::dtype(at::kInt).device(x.device()));
+        }
+        if (!c_dispatch_cam_recv_offset.defined() || c_dispatch_cam_recv_offset.numel() != num_experts) {
+            c_dispatch_cam_recv_offset = torch::empty({num_experts}, at::dtype(at::kInt).device(x.device()));
+        }
+        if (!c_dispatch_max_bs.defined()) {
+            c_dispatch_max_bs = torch::empty({1}, at::dtype(at::kInt).device(x.device()));
+        }
+        if (!c_dispatch_recv_tokens_per_expert.defined() ||
+            c_dispatch_recv_tokens_per_expert.size(0) != num_local_experts) {
+            c_dispatch_recv_tokens_per_expert = torch::empty({num_local_experts}, at::dtype(at::kLong).device(x.device()));
+        }
+        send_data = c_dispatch_cam_send_data;
+        send_data_offset = c_dispatch_cam_send_data_offset;
+        recv_data = c_dispatch_cam_recv_data;
+        total_recv_token_ = c_dispatch_total_recv_token;
+        recv_count_ = torch::empty({num_experts}, at::dtype(at::kInt).device(x.device()));  // returned
+        recv_offset_ = c_dispatch_cam_recv_offset;
+        max_bs_ = c_dispatch_max_bs;
+        recv_tokens_per_expert_ = c_dispatch_recv_tokens_per_expert;
+        put_offset_ = torch::empty({1}, at::dtype(at::kInt).device(x.device()));  // not use, returned
 
         // get ep name
         if (!moe_all_to_all_group_name.empty()) {
@@ -511,7 +558,10 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     }
 
     int64_t hidden = static_cast<int>(recv_x.size(1));
-    at::Tensor tp_send_counts = at::empty({1}, at::dtype(at::kInt).device(device));
+    if (!c_combine_tp_send_counts.defined()) {
+        c_combine_tp_send_counts = at::empty({1}, at::dtype(at::kInt).device(device));
+    }
+    at::Tensor tp_send_counts = c_combine_tp_send_counts;
     int64_t tp_world_size = 1;
     int64_t tp_rankId = 0;
     int64_t global_bs = topk_idx_p.size(0) * num_ranks;
@@ -530,7 +580,18 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         moe_expert_number = put_offset.size(0);
         ext_info = reinterpret_cast<uint64_t>(shmem_ptr);
 
-        EXEC_NPU_CMD(aclnnShmemMoeCombineNormal, recv_x, ep_send_counts, expert_scales, expand_ids,
+        // x may not reside on shmem-allocated memory; copy it to a shmem tensor
+        // so the operator receives a tensor backed by symmetric shared memory.
+        if (!c_combine_shmem_x.defined() ||
+            c_combine_shmem_x.size(0) != recv_x.size(0) ||
+            c_combine_shmem_x.size(1) != hidden ||
+            c_combine_shmem_x.scalar_type() != recv_x.scalar_type()) {
+            c_combine_shmem_x = create_tensor_from_shmem(
+                std::vector<int64_t>{recv_x.size(0), hidden}, recv_x.scalar_type(), device);
+        }
+        c_combine_shmem_x.copy_(recv_x);
+
+        EXEC_NPU_CMD(aclnnShmemMoeCombineNormal, c_combine_shmem_x, ep_send_counts, expert_scales, expand_ids,
                      this->send_token_idx_small, ext_info, num_ranks, rank, tp_world_size, tp_rankId, moe_expert_number,
                      global_bs, combined_x, combine_send_cost_stats_out);
     } else {

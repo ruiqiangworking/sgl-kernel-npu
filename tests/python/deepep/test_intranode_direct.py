@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import os
+import random
 import time
 from functools import partial
 from typing import List, Optional, Tuple
@@ -777,7 +778,7 @@ def test_loop(
     )
     print(f"[Rank {rank}] Buffer created OK.", flush=True)
 
-    num_tokens = args.num_tokens
+    num_tokens = random.randint(1, args.num_tokens)
     hidden = args.hidden
     num_topk = args.num_topk
     num_experts = args.num_experts

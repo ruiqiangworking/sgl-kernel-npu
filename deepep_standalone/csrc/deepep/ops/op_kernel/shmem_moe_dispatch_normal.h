@@ -197,8 +197,9 @@ __aicore__ inline void ShmemMoeDispatchNormal<CamTypeFunc>::QuantInit()
     tpipe_->InitBuffer(xInQueue, BUFFER_NUM, hAlignSize);        // 14K * 2
     tpipe_->InitBuffer(xOutQueue, BUFFER_NUM, hOutUBAlignSize);  // 7K * 2
 
-    tpipe_->InitBuffer(tokenCastFloatBuf, h * sizeof(float));  // 28K
-    tpipe_->InitBuffer(tokenAbsFloatBuf, h * sizeof(float));   // 28K
+    uint32_t hFloatAlignSize = Ceil(h * sizeof(float), UB_ALIGN) * UB_ALIGN;
+    tpipe_->InitBuffer(tokenCastFloatBuf, hFloatAlignSize);
+    tpipe_->InitBuffer(tokenAbsFloatBuf, hFloatAlignSize);
 }
 
 template <CamTypeClass>
