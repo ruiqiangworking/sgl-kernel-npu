@@ -36,7 +36,7 @@ import deep_ep
 import deep_ep_cpp
 
 from hccl_dispatcher import HCCLDispatcher
-from utils import bench, init_dist, inplace_unique
+from utils import bench, init_dist, inplace_unique, per_token_cast_back
 
 
 # =========================================================================== #
@@ -179,18 +179,20 @@ def call_intranode_dispatch(
     is_token_in_rank: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
     config: deep_ep_cpp.Config,
-) -> Tuple[torch.Tensor, list, tuple]:
+    use_quant: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], list, tuple]:
     """
     调用 deep_ep_cpp.Buffer.intranode_dispatch。
 
     Returns:
-        (recv_x, num_recv_tokens_per_expert_list, handle)
+        (recv_x, recv_x_scales, num_recv_tokens_per_expert_list, handle)
         其中 handle 是 combine 所需的元组。
+        当 use_quant=True 时 recv_x 为 int8, recv_x_scales 为 float32 scales。
     """
     previous_event: Optional[deep_ep_cpp.EventHandle] = None
     (
         recv_x,                         # expandx_out
-        _recv_x_scales,                 # dynamic_scales_out
+        recv_x_scales,                  # dynamic_scales_out
         recv_topk_idx,                  # recv_topk_idx (optional)
         recv_topk_weights,              # recv_topk_weights (optional)
         num_recv_tokens_per_expert_list,
@@ -219,7 +221,7 @@ def call_intranode_dispatch(
         previous_event,                # previous_event
         False,                         # async
         False,                         # allocate_on_comm_stream
-        False,                         # use_quant
+        use_quant,                     # use_quant
     )
     # 构造 combine 所需的 handle（与 Python Buffer.dispatch 一致）
     handle = (
@@ -233,7 +235,7 @@ def call_intranode_dispatch(
         topk_weights,
         put_offset,
     )
-    return recv_x, num_recv_tokens_per_expert_list, handle
+    return recv_x, recv_x_scales, num_recv_tokens_per_expert_list, handle
 
 
 def call_intranode_combine(
@@ -317,7 +319,7 @@ def verify_dispatch_layout(
         token_sel = (rank_idx == i).max(dim=-1)[0]
         count = token_sel.sum().item()
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
-        tokens[:count] = torch.sort(tokens[:count])[0]
+        tokens[:count] = torch.sort(tokens[:count].clone())[0]
         token_idx_in_rank[i][tokens[:count]] = torch.arange(
             count, dtype=torch.long, device=device
         )
@@ -407,6 +409,7 @@ def verify_dispatch_with_hccl(
     """对比 deep_ep_cpp dispatch 输出与 HCCLDispatcher dispatch 输出。"""
     actual_np = recv_x.float().cpu().numpy()
     expected_np = hccl_dispatch_out.float().cpu().numpy()
+    actual_np = actual_np[tuple(slice(0, s) for s in expected_np.shape)]
     passed = np.allclose(actual_np, expected_np, atol=threshold, rtol=threshold)
     assert passed, (
         f"dispatch vs HCCLDispatcher mismatch on rank {rank}: "
@@ -445,10 +448,12 @@ def test_fixed_correctness(
     num_ranks: int,
     rank: int,
     group: dist.ProcessGroup,
+    use_quant: bool = False,
 ) -> None:
     """规律输入正确性测试：使用本地模拟校验。"""
+    quant_tag = " (quant)" if use_quant else ""
     if rank == 0:
-        print("\n--- [Fixed Input] Correctness Test ---", flush=True)
+        print(f"\n--- [Fixed Input{quant_tag}] Correctness Test ---", flush=True)
 
     x, topk_idx, topk_weights = build_fixed_inputs(
         num_tokens, hidden, num_topk, num_experts, rank
@@ -465,21 +470,27 @@ def test_fixed_correctness(
     )
 
     # 2) intranode_dispatch
-    recv_x, recv_expert_list, handle = call_intranode_dispatch(
+    recv_x, recv_x_scales, recv_expert_list, handle = call_intranode_dispatch(
         buffer, x, topk_idx, topk_weights,
         num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, config,
+        use_quant=use_quant,
     )
     verify_dispatch_expert_tokens(
         gbl_num_tokens_per_expert, recv_expert_list, rank, num_ranks
     )
 
+    # 开启量化时对 dispatch 输出进行反量化
+    if use_quant:
+        recv_x = per_token_cast_back(recv_x, recv_x_scales)
+
     # 3) intranode_combine
     combined_x = call_intranode_combine(buffer, recv_x, handle)
-    verify_combine_local(combined_x, x, topk_weights, topk_idx, rank)
+    threshold = 5e-2 if use_quant else 5e-5
+    verify_combine_local(combined_x, x, topk_weights, topk_idx, rank, threshold=threshold)
 
     dist.barrier()
     if rank == 0:
-        print("--- [Fixed Input] All ranks PASSED ---\n", flush=True)
+        print(f"--- [Fixed Input{quant_tag}] All ranks PASSED ---\n", flush=True)
 
 
 # =========================================================================== #
@@ -495,10 +506,12 @@ def test_random_correctness(
     num_ranks: int,
     rank: int,
     group: dist.ProcessGroup,
+    use_quant: bool = False,
 ) -> None:
     """随机输入正确性测试：使用 HCCLDispatcher 作为参考实现校验。"""
+    quant_tag = " (quant)" if use_quant else ""
     if rank == 0:
-        print("\n--- [Random Input] Correctness Test ---", flush=True)
+        print(f"\n--- [Random Input{quant_tag}] Correctness Test ---", flush=True)
 
     x, topk_idx, topk_weights = build_random_inputs(
         num_tokens, hidden, num_topk, num_experts
@@ -517,13 +530,18 @@ def test_random_correctness(
         num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank,
     )
 
-    recv_x, recv_expert_list, handle = call_intranode_dispatch(
+    recv_x, recv_x_scales, recv_expert_list, handle = call_intranode_dispatch(
         buffer, x, topk_idx, topk_weights,
         num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, config,
+        use_quant=use_quant,
     )
     verify_dispatch_expert_tokens(
         gbl_num_tokens_per_expert, recv_expert_list, rank, num_ranks
     )
+
+    # 开启量化时对 dispatch 输出进行反量化
+    if use_quant:
+        recv_x = per_token_cast_back(recv_x, recv_x_scales)
 
     combined_x = call_intranode_combine(buffer, recv_x, handle)
 
@@ -532,13 +550,14 @@ def test_random_correctness(
     hccl_dispatch_out = hccl_dispatcher.dispatch(x, topk_idx, topk_weights)
     hccl_combine_out = hccl_dispatcher.combine(hccl_dispatch_out)
 
-    # ---- 对比 ----
-    verify_dispatch_with_hccl(recv_x, hccl_dispatch_out, rank)
-    verify_combine_with_hccl(combined_x, hccl_combine_out, rank)
+    # ---- 对比（量化会引入精度损失，放宽阈值） ----
+    threshold = 5e-2 if use_quant else 5e-5
+    verify_dispatch_with_hccl(recv_x, hccl_dispatch_out, rank, threshold=threshold)
+    verify_combine_with_hccl(combined_x, hccl_combine_out, rank, threshold=threshold)
 
     dist.barrier()
     if rank == 0:
-        print("--- [Random Input] All ranks PASSED ---\n", flush=True)
+        print(f"--- [Random Input{quant_tag}] All ranks PASSED ---\n", flush=True)
 
 
 # =========================================================================== #
@@ -554,11 +573,13 @@ def _run_deepep_dispatch(
     is_token_in_rank: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
     config: deep_ep_cpp.Config,
+    use_quant: bool = False,
 ) -> None:
     """deep_ep_cpp dispatch 单次执行（用于 bench）。"""
     call_intranode_dispatch(
         buffer, x, topk_idx, topk_weights,
         num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, config,
+        use_quant=use_quant,
     )
 
 
@@ -600,6 +621,7 @@ def bench_performance(
     group: dist.ProcessGroup,
     num_warmups: int = 10,
     num_tests: int = 100,
+    use_quant: bool = False,
 ) -> None:
     """
     对比 deep_ep_cpp.Buffer 与 HCCLDispatcher 的 dispatch/combine 性能。
@@ -607,8 +629,9 @@ def bench_performance(
     暖机 num_warmups 次，测试 num_tests 次。
     在 rank 0 打印汇总表格。
     """
+    quant_tag = " (quant)" if use_quant else ""
     if rank == 0:
-        print("\n--- Performance Benchmark ---", flush=True)
+        print(f"\n--- Performance Benchmark{quant_tag} ---", flush=True)
 
     x, topk_idx, topk_weights = build_random_inputs(
         num_tokens, hidden, num_topk, num_experts
@@ -620,10 +643,15 @@ def bench_performance(
     num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank = (
         call_get_dispatch_layout(buffer, topk_idx, num_experts)
     )
-    recv_x, _, handle = call_intranode_dispatch(
+    recv_x, recv_x_scales, _, handle = call_intranode_dispatch(
         buffer, x, topk_idx, topk_weights,
         num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, config,
+        use_quant=use_quant,
     )
+
+    # 开启量化时对 dispatch 输出进行反量化
+    if use_quant:
+        recv_x = per_token_cast_back(recv_x, recv_x_scales)
 
     hccl_dispatcher = HCCLDispatcher(group, num_experts, experts_per_rank)
     hccl_dispatch_out = hccl_dispatcher.dispatch(x, topk_idx, topk_weights)
@@ -634,6 +662,7 @@ def bench_performance(
             _run_deepep_dispatch,
             buffer, x, topk_idx, topk_weights,
             num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, config,
+            use_quant,
         ),
         num_warmups=num_warmups,
         num_tests=num_tests,
@@ -784,28 +813,34 @@ def test_loop(
     num_experts = args.num_experts
 
     mode = args.mode
+    use_quant = args.use_quant
 
     print_test_config(rank, num_tokens, hidden, num_topk, num_experts, num_ranks)
+    if rank == 0:
+        print(f"  use_quant    = {use_quant}", flush=True)
     dist.barrier()
     time.sleep(1)
-
-    if mode == "fixed":
-        test_fixed_correctness(
-            buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, group
-        )
-    elif mode == "random":
-        test_random_correctness(
-            buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, group
-        )
-    elif mode == "bench":
-        bench_performance(
-            buffer, num_tokens, hidden, num_topk, num_experts,
-            num_ranks, rank, group,
-            num_warmups=10,
-            num_tests=100,
-        )
-    else:
-        raise ValueError(f"Unknown mode: {mode}. Choose from: fixed, random, bench")
+    for _ in range(1000):
+        if mode == "fixed":
+            test_fixed_correctness(
+                buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, group,
+                use_quant=use_quant,
+            )
+        elif mode == "random":
+            test_random_correctness(
+                buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, group,
+                use_quant=use_quant,
+            )
+        elif mode == "bench":
+            bench_performance(
+                buffer, num_tokens, hidden, num_topk, num_experts,
+                num_ranks, rank, group,
+                num_warmups=10,
+                num_tests=100,
+                use_quant=use_quant,
+            )
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Choose from: fixed, random, bench")
 
     dist.barrier()
     dist.destroy_process_group()
@@ -849,6 +884,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--shmem", type=int, default=1, choices=[0, 1],
         help="Set DEEPEP_SHMEM_ENABLE: 1 to enable shmem, 0 to disable (default: 1)",
+    )
+    parser.add_argument(
+        "--use-quant", action="store_true", default=False,
+        help="Enable int8 quantization for dispatch (default: disabled)",
     )
     args = parser.parse_args()
 
