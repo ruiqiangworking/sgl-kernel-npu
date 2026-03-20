@@ -35,9 +35,131 @@ import torch.distributed as dist
 import deep_ep
 import deep_ep_cpp
 
-from hccl_dispatcher import HCCLDispatcher
 from utils import bench, init_dist, inplace_unique, per_token_cast_back
 
+def async_all_to_all(input_,
+                     output_split_sizes,
+                     input_split_sizes,
+                     group,
+                     event=None):
+    if output_split_sizes is None:
+        a2a_out = torch.empty_like(input_)
+    else:
+        a2a_out = input_.new_empty(
+            size=[sum(output_split_sizes)] + list(input_.size()[1:]),
+            dtype=input_.dtype,
+            device=torch.npu.current_device(),
+        )
+
+    if event:
+        global COMM_STREAM
+        if 'COMM_STREAM' not in globals() or COMM_STREAM is None:
+            COMM_STREAM = torch_npu.npu.Stream(device=torch.npu.current_device())
+        with torch_npu.npu.stream(COMM_STREAM):
+            event.wait()
+            handle = dist.all_to_all_single(
+                a2a_out,
+                input_.contiguous(),
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+                async_op=True)
+    else:
+        handle = dist.all_to_all_single(a2a_out,
+                                        input_.contiguous(),
+                                        output_split_sizes=output_split_sizes,
+                                        input_split_sizes=input_split_sizes,
+                                        group=group,
+                                        async_op=True)
+    return input_, a2a_out, handle
+
+def _gather_along_first_dim(input_, group, output_split_sizes=None):
+    world_size = torch.distributed.get_world_size(group)
+    if world_size == 1:
+        return input_
+
+    dim_size = list(input_.size())
+    if output_split_sizes is None:
+        dim_size[0] = dim_size[0] * world_size
+        output = torch.empty(dim_size, dtype=input_.dtype, device=torch.npu.current_device())
+        torch.distributed.all_gather_into_tensor(output, input_.contiguous(), group=group)
+    else:
+        dim_size[0] = sum(output_split_sizes)
+        output = torch.empty(dim_size, dtype=input_.dtype, device=torch.npu.current_device())
+        output_tensor_list = list(torch.split(output, output_split_sizes, dim=0))
+        torch.distributed.all_gather(output_tensor_list, input_, group=group)
+
+    return output
+
+def gather_from_sequence_parallel_region(input_, group, output_split_sizes=None):
+    return _gather_along_first_dim(input_, group, output_split_sizes)
+
+class HCCLDispatcher:
+    def __init__(self, ep_group, num_experts, num_local_experts):
+        self.ep_group = ep_group
+        self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
+        self.ep_size = dist.get_world_size(ep_group)
+        self.ep_rank = dist.get_rank(ep_group)
+        
+        local_expert_indices_offset = (self.ep_rank * self.num_local_experts)
+        self.local_expert_indices = [local_expert_indices_offset + i for i in range(self.num_local_experts)]
+        
+        self.expert_ids_per_ep_rank = torch.tensor(
+            [i % self.num_local_experts for i in range(self.num_experts)],
+            dtype=torch.int32, device="npu"
+        )
+
+    def dispatch(self, hidden_states, topk_ids, topk_weights):
+        self.hidden_shape = hidden_states.shape
+        self.topk_weights = topk_weights
+        hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        
+        # 1. Preprocess: Count tokens per expert
+        num_local_tokens_per_expert = torch.histc(topk_ids.float(), bins=self.num_experts, min=0, max=self.num_experts)
+        
+        # Calculate splits
+        self.input_splits = (num_local_tokens_per_expert.reshape(self.ep_size, self.num_local_experts)
+                             .sum(axis=1).to(torch.int64).cpu().numpy().tolist())
+
+        num_global_tokens_per_expert = gather_from_sequence_parallel_region(num_local_tokens_per_expert, self.ep_group).reshape(self.ep_size, self.num_experts)
+        self.num_global_tokens_per_local_expert = num_global_tokens_per_expert[:, self.local_expert_indices[0]:self.local_expert_indices[-1] + 1]
+        
+        self.output_splits = self.num_global_tokens_per_local_expert.sum(axis=-1).to(torch.int64).cpu().numpy().tolist()
+        
+        # 2. Permute tokens locally
+        permutated_tokens, self.reversed_local_mapping = torch_npu.npu_moe_token_permute(
+            hidden_states, topk_ids.to(torch.int32), num_out_tokens=topk_ids.numel()
+        )
+        
+        # 3. AllToAllV
+        _, global_input_tokens, handle = async_all_to_all(permutated_tokens, self.output_splits, self.input_splits, self.ep_group)
+        handle.wait()
+        
+        # 4. Post-process (Re-permute for local experts)
+        self.global_tokens_indices = torch.repeat_interleave(
+            self.expert_ids_per_ep_rank, self.num_global_tokens_per_local_expert.ravel().to(torch.int32)
+        )
+        
+        dispatch_out, self.reversed_global_mapping = torch_npu.npu_moe_token_permute(
+            global_input_tokens, self.global_tokens_indices
+        )
+        return dispatch_out
+
+    def combine(self, hidden_states):
+        # 1. Unpermute locally
+        hidden_states = torch_npu.npu_moe_token_unpermute(hidden_states, self.reversed_global_mapping)
+        
+        # 2. AllToAllV back
+        _, local_tokens, handle = async_all_to_all(hidden_states, self.input_splits, self.output_splits, self.ep_group)
+        handle.wait()
+        
+        # 3. Final unpermute and weighted sum
+        output = torch_npu.npu_moe_token_unpermute(
+            local_tokens, self.reversed_local_mapping.to(torch.int32), 
+            probs=self.topk_weights, restore_shape=self.hidden_shape
+        )
+        return output
 
 # =========================================================================== #
 #                           参数 / 配置 辅助
@@ -781,6 +903,8 @@ def test_loop(
     os.environ["DEEPEP_SHMEM_ENABLE"] = str(args.shmem)
 
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    random.seed(rank + 42)
+    np.random.seed(rank + 42)
     torch.manual_seed(rank + 42)
 
     shmem_status = "enabled" if args.shmem == 1 else "disabled"
