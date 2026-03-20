@@ -37,6 +37,7 @@ struct Buffer {
 
 private:
     std::string moe_all_to_all_group_name;
+    std::string shmem_server_ipport;
     void *shmem_ptr = nullptr;
     bool shmem_enable;
 
@@ -48,7 +49,7 @@ private:
 
 public:
     Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode,
-           std::string moe_all_to_all_group_name);
+           std::string moe_all_to_all_group_name, std::string shmem_server_ipport = "127.0.0.1:11222");
 
     ~Buffer() noexcept(false);
 

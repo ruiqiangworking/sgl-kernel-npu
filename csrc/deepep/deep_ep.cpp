@@ -56,13 +56,14 @@ torch::Tensor create_tensor_from_shmem(const std::vector<int64_t> &shape, at::Sc
 }
 
 Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode,
-               std::string moe_all_to_all_group_name)
+               std::string moe_all_to_all_group_name, std::string shmem_server_ipport)
     : rank(rank),
       num_ranks(num_ranks),
       num_nvl_bytes(num_nvl_bytes),
       num_rdma_bytes(num_rdma_bytes),
       low_latency_mode(low_latency_mode),
-      moe_all_to_all_group_name(moe_all_to_all_group_name)
+      moe_all_to_all_group_name(moe_all_to_all_group_name),
+      shmem_server_ipport(std::move(shmem_server_ipport))
 {
     rdma_rank = rank;
     EP_HOST_ASSERT(0 <= rank and rank < num_ranks);
@@ -89,7 +90,8 @@ Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t n
         size_t num_of_int32 = meta_data_size / ele_size;
 
         // To be initialized by the caller
-        EP_HOST_ASSERT(rank == internode::init(rank, num_ranks, local_mem_size, "tcp://127.0.0.1:11222"));
+        std::string shmem_uri = "tcp://" + this->shmem_server_ipport;
+        EP_HOST_ASSERT(rank == internode::init(rank, num_ranks, local_mem_size, shmem_uri.c_str()));
         shmem_ptr = internode::alloc(num_of_int32, ele_size);
     } else {
         if (moe_all_to_all_group_name.empty()) {

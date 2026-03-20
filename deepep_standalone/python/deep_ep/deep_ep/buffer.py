@@ -23,6 +23,7 @@ class Buffer:
         num_qps_per_rank: int = 12,
         allow_nvlink_for_low_latency_mode: bool = True,
         allow_mnnvl: bool = False,
+        shmem_server_ipport: str = "127.0.0.1:11222",
     ) -> None:
         """
         Initialize the communication buffer.
@@ -37,6 +38,7 @@ class Buffer:
                 to the number of local experts.
             allow_nvlink_for_low_latency_mode: This parameter is deprecated and retained to ensure compatibility with DeepEP.
             allow_mnnvl: This parameter is deprecated and retained to ensure compatibility with DeepEP.
+            shmem_server_ipport: the IP:Port address for Shmem communication domain (e.g. "192.168.1.1:11222").
         """
 
         self.rank = group.rank()
@@ -57,6 +59,7 @@ class Buffer:
             num_rdma_bytes,
             low_latency_mode,
             moe_all_to_all_group_name,
+            shmem_server_ipport,
         )
 
     @staticmethod
