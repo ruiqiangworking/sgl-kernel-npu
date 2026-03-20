@@ -182,6 +182,7 @@ public:
         magicGT(0) = static_cast<uint64_t>(magic_) + 1ULL;
         DataCacheCleanAndInvalid<uint64_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(magicGT);
         PipeBarrier<PIPE_ALL>();
+        barrierSeq_ = 0;
     }
 
     // ========================================================================
@@ -371,8 +372,10 @@ public:
         uint32_t perCore = 0U, startRank = 0U, endRank = 0U;
         SplitCoreCal(epWorldSize_, perCore, startRank, endRank);
 
-        // Barrier flag value: (magic << 32) | 1
-        const int64_t barrierFlag = MakeFlagValue(magic_, 1);
+        // Barrier flag value: (magic << 32) | barrierSeq
+        // Auto-incrementing barrierSeq_ ensures consecutive BarrierAll calls
+        // within the same magic produce distinct flag values.
+        const int64_t barrierFlag = MakeFlagValue(magic_, ++barrierSeq_);
         LocalTensor<int64_t> ubFlag = tBuf_.GetWithOffset<int64_t>(FLAG_ELEM_NUM, 0);
 
         // Select pingpong buffer for barrier: magic % 2
@@ -532,6 +535,7 @@ private:
     uint64_t bufSize_{0};            // single pingpong flag buffer size in bytes
     uint64_t flagBufBaseOffset_{0};  // offset from flagBaseGM_ to flag buffer area
     int32_t magic_{0};               // monotonically incrementing, +1 per kernel call
+    int32_t barrierSeq_{0};          // per-magic barrier sequence, reset in IncrementMagic
     TBuf<QuePosition::VECCALC> tBuf_;
 };
 
