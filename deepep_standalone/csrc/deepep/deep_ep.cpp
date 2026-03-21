@@ -7,6 +7,7 @@
 #include "deep_ep.hpp"
 #include "pytorch_npu_helper.hpp"
 #include "shmem.hpp"
+#include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace deep_ep {
 constexpr int PADDING_SIZE = 1;
@@ -50,7 +51,7 @@ torch::Tensor create_tensor_from_shmem(const std::vector<int64_t> &shape, at::Sc
     auto options = torch::TensorOptions().dtype(dtype).device(device);
 
     torch::Tensor tensor =
-        torch::from_blob(dev_ptr, c10::IntArrayRef(shape), [](void *ptr) { shmem_free(ptr); }, options);
+        at_npu::native::from_blob(dev_ptr, c10::IntArrayRef(shape), [](void *ptr) { shmem_free(ptr); }, options);
 
     return tensor;
 }
