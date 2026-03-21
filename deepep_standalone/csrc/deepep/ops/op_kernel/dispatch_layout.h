@@ -192,6 +192,19 @@ public:
         uint32_t maxTempTokens = aivNum_ > 0 ? (numTokens_ / aivNum_ + (numTokens_ % aivNum_ > 0 ? 1 : 0)) : 0;
         uint32_t maxNumRounds = (maxTempTokens + tokensPerRound - 1) / tokensPerRound;
 
+        // Zero out numTokensPerExpert in GM before accumulation (core 0 writes, all cores sync)
+        if (coreIdx_ == 0) {
+            tpipe_->Reset();
+            tpipe_->InitBuffer(numTokensPerExpertBuf_, numTokensPerExpert32AlignIntLen_);
+            LocalTensor<T> zeroExpertLocal = numTokensPerExpertBuf_.AllocTensor<T>();
+            Duplicate<T>(zeroExpertLocal, 0, numExperts_);
+            SyncFunc<AscendC::HardEvent::V_S>();
+            const DataCopyExtParams zeroExpertParams{1U, numExperts_ * static_cast<uint32_t>(sizeof(T)), 0U, 0U, 0U};
+            DataCopyPad(numTokensPerExpertGM_, zeroExpertLocal, zeroExpertParams);
+            PipeBarrier<PIPE_MTE3>();
+        }
+        SyncAll<true>();
+
         // Inactive cores: participate in all Phase 1 SyncAll barriers then return.
         // Phase 2 has no cross-core dependency, so no SyncAll is needed there.
         if (coreIdx_ >= aivNum_) {

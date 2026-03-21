@@ -157,9 +157,8 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts, std:
     at::Tensor num_tokens_per_expert;
     if (shmem_enable) {
         num_tokens_per_expert = create_tensor_from_shmem(std::vector<int64_t>{num_experts}, at::kInt, device);
-        num_tokens_per_expert.fill_(0);
     } else {
-        num_tokens_per_expert = at::zeros({num_experts}, at::dtype(at::kInt).device(device));
+        num_tokens_per_expert = at::empty({num_experts}, at::dtype(at::kInt).device(device));
     }
     auto num_tokens_per_rank = at::zeros({num_ranks}, at::dtype(at::kInt).device(device));
     auto is_token_in_rank = at::zeros({num_tokens, num_ranks}, at::dtype(at::kInt).device(device));
