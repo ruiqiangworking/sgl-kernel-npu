@@ -35,7 +35,7 @@ import torch.distributed as dist
 import deep_ep
 import deep_ep_cpp
 
-from utils import bench, init_dist, inplace_unique, per_token_cast_back
+from utils import bench, bench_kineto, init_dist, inplace_unique, per_token_cast_back
 
 def async_all_to_all(input_,
                      output_split_sizes,
@@ -495,7 +495,8 @@ def verify_combine_local(
     topk_weights: torch.Tensor,
     topk_idx: torch.Tensor,
     rank: int,
-    threshold: float = 5e-5,
+    atol: float = 5e-5,
+    rtol: float = 5e-5,
 ) -> None:
     """
     使用本地公式校验 combine 结果。
@@ -507,10 +508,13 @@ def verify_combine_local(
 
     actual_np = combined_x.float().cpu().numpy()
     expected_np = expected_x.cpu().numpy()
-    passed = np.allclose(actual_np, expected_np, atol=threshold, rtol=threshold)
+    passed = np.allclose(actual_np, expected_np, atol=atol, rtol=rtol)
+    abs_diff = np.max(np.abs(actual_np - expected_np))
+    rel_diff = np.max(np.abs(actual_np - expected_np) / (np.abs(expected_np) + 1e-12))
     assert passed, (
         f"combine output mismatch on rank {rank}: "
-        f"max_abs_diff={np.max(np.abs(actual_np - expected_np)):.6e} > threshold={threshold:.6e}"
+        f"max_abs_diff={abs_diff:.6e}, max_rel_diff={rel_diff:.6e} "
+        f"(atol={atol:.6e}, rtol={rtol:.6e})"
     )
     print(f"  rank {rank}: combine (local verify) PASSED", flush=True)
 
@@ -523,16 +527,20 @@ def verify_dispatch_with_hccl(
     recv_x: torch.Tensor,
     hccl_dispatch_out: torch.Tensor,
     rank: int,
-    threshold: float = 5e-5,
+    atol: float = 5e-5,
+    rtol: float = 5e-5,
 ) -> None:
     """对比 deep_ep_cpp dispatch 输出与 HCCLDispatcher dispatch 输出。"""
     actual_np = recv_x.float().cpu().numpy()
     expected_np = hccl_dispatch_out.float().cpu().numpy()
     actual_np = actual_np[tuple(slice(0, s) for s in expected_np.shape)]
-    passed = np.allclose(actual_np, expected_np, atol=threshold, rtol=threshold)
+    passed = np.allclose(actual_np, expected_np, atol=atol, rtol=rtol)
+    abs_diff = np.max(np.abs(actual_np - expected_np))
+    rel_diff = np.max(np.abs(actual_np - expected_np) / (np.abs(expected_np) + 1e-12))
     assert passed, (
         f"dispatch vs HCCLDispatcher mismatch on rank {rank}: "
-        f"max_abs_diff={np.max(np.abs(actual_np - expected_np)):.6e}"
+        f"max_abs_diff={abs_diff:.6e}, max_rel_diff={rel_diff:.6e} "
+        f"(atol={atol:.6e}, rtol={rtol:.6e})"
     )
     print(f"  rank {rank}: dispatch (HCCL verify) PASSED", flush=True)
 
@@ -541,15 +549,19 @@ def verify_combine_with_hccl(
     combined_x: torch.Tensor,
     hccl_combine_out: torch.Tensor,
     rank: int,
-    threshold: float = 5e-5,
+    atol: float = 5e-5,
+    rtol: float = 5e-5,
 ) -> None:
     """对比 deep_ep_cpp combine 输出与 HCCLDispatcher combine 输出。"""
     actual_np = combined_x.float().cpu().numpy()
     expected_np = hccl_combine_out.float().cpu().numpy()
-    passed = np.allclose(actual_np, expected_np, atol=threshold, rtol=threshold)
+    passed = np.allclose(actual_np, expected_np, atol=atol, rtol=rtol)
+    abs_diff = np.max(np.abs(actual_np - expected_np))
+    rel_diff = np.max(np.abs(actual_np - expected_np) / (np.abs(expected_np) + 1e-12))
     assert passed, (
         f"combine vs HCCLDispatcher mismatch on rank {rank}: "
-        f"max_abs_diff={np.max(np.abs(actual_np - expected_np)):.6e}"
+        f"max_abs_diff={abs_diff:.6e}, max_rel_diff={rel_diff:.6e} "
+        f"(atol={atol:.6e}, rtol={rtol:.6e})"
     )
     print(f"  rank {rank}: combine (HCCL verify) PASSED", flush=True)
 
@@ -604,8 +616,10 @@ def test_fixed_correctness(
 
     # 3) intranode_combine
     combined_x = call_intranode_combine(buffer, recv_x, handle)
-    threshold = 5e-2 if use_quant else 5e-5
-    verify_combine_local(combined_x, x, topk_weights, topk_idx, rank, threshold=threshold)
+    if use_quant:
+        verify_combine_local(combined_x, x, topk_weights, topk_idx, rank, atol=0, rtol=5e-2)
+    else:
+        verify_combine_local(combined_x, x, topk_weights, topk_idx, rank, atol=5e-5, rtol=5e-5)
 
     dist.barrier()
     if rank == 0:
@@ -669,10 +683,13 @@ def test_random_correctness(
     hccl_dispatch_out = hccl_dispatcher.dispatch(x, topk_idx, topk_weights)
     hccl_combine_out = hccl_dispatcher.combine(hccl_dispatch_out)
 
-    # ---- 对比（量化会引入精度损失，放宽阈值） ----
-    threshold = 5e-2 if use_quant else 5e-5
-    verify_dispatch_with_hccl(recv_x, hccl_dispatch_out, rank, threshold=threshold)
-    verify_combine_with_hccl(combined_x, hccl_combine_out, rank, threshold=threshold)
+    # ---- 对比（量化只校验相对精度） ----
+    if use_quant:
+        verify_dispatch_with_hccl(recv_x, hccl_dispatch_out, rank, atol=0, rtol=5e-2)
+        verify_combine_with_hccl(combined_x, hccl_combine_out, rank, atol=0, rtol=5e-2)
+    else:
+        verify_dispatch_with_hccl(recv_x, hccl_dispatch_out, rank, atol=5e-5, rtol=5e-5)
+        verify_combine_with_hccl(combined_x, hccl_combine_out, rank, atol=5e-5, rtol=5e-5)
 
     dist.barrier()
     if rank == 0:
@@ -887,6 +904,105 @@ def _print_perf_table(
 
 
 # =========================================================================== #
+#                    Kineto Profiling 性能测试
+# =========================================================================== #
+
+# shmem 模式下完整 MoE 流程默认抓取的 kernel 名称（layout + dispatch + combine）
+SHMEM_MOE_KERNELS = (
+    "DispatchLayout",
+    "ShmemNotifyDispatch",
+    "ShmemMoeDispatchNormal",
+    "ShmemMoeCombineNormal",
+)
+
+
+def _run_full_moe_flow(
+    buffer: deep_ep_cpp.Buffer,
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    config: deep_ep_cpp.Config,
+    use_quant: bool = False,
+) -> None:
+    """完整 MoE 流程单次执行：layout -> dispatch -> combine。"""
+    num_tokens_per_rank, num_tokens_per_expert, is_token_in_rank = (
+        call_get_dispatch_layout(buffer, topk_idx, num_experts)
+    )
+    recv_x, recv_x_scales, _, handle = call_intranode_dispatch(
+        buffer, x, topk_idx, topk_weights,
+        num_tokens_per_rank, is_token_in_rank, num_tokens_per_expert, config,
+        use_quant=use_quant,
+    )
+    if use_quant:
+        recv_x = per_token_cast_back(recv_x, recv_x_scales)
+    call_intranode_combine(buffer, recv_x, handle)
+
+
+def bench_performance_kineto(
+    buffer: deep_ep_cpp.Buffer,
+    num_tokens: int,
+    hidden: int,
+    num_topk: int,
+    num_experts: int,
+    num_ranks: int,
+    rank: int,
+    group: dist.ProcessGroup,
+    num_tests: int = 30,
+    trace_dir: str = "./traces",
+    use_quant: bool = False,
+) -> None:
+    """
+    使用 bench_kineto 对完整 MoE 流程（layout -> dispatch -> combine）进行性能分析，
+    抓取所有 shmem 相关算子的 kernel 耗时并保存 chrome trace 到 trace_dir。
+    """
+    quant_tag = " (quant)" if use_quant else ""
+    if rank == 0:
+        print(f"\n--- Kineto Full MoE Flow Profiling{quant_tag} ---", flush=True)
+        print(f"  trace_dir:   {trace_dir}", flush=True)
+        print(f"  num_tests:   {num_tests}", flush=True)
+        print(f"  kernels:     {SHMEM_MOE_KERNELS}", flush=True)
+
+    os.makedirs(trace_dir, exist_ok=True)
+
+    x, topk_idx, topk_weights = build_random_inputs(
+        num_tokens, hidden, num_topk, num_experts
+    )
+    config = make_config()
+
+    fn = partial(
+        _run_full_moe_flow,
+        buffer, x, topk_idx, topk_weights, num_experts, config, use_quant,
+    )
+
+    trace_path = os.path.join(trace_dir, f"rank{rank}_full_moe_flow.json")
+    durations = bench_kineto(
+        fn,
+        kernel_names=SHMEM_MOE_KERNELS,
+        num_tests=num_tests,
+        trace_path=trace_path,
+        suppress_kineto_output=True,
+    )
+
+    if rank == 0:
+        print(f"\n  Kernel durations (avg over {num_tests} iters):", flush=True)
+        for kname, dur in zip(SHMEM_MOE_KERNELS, durations):
+            print(f"    {kname}: {dur * 1e3:.4f} ms", flush=True)
+        total = sum(durations) * 1e3
+        print(f"    {'─' * 50}", flush=True)
+        print(f"    Total (shmem kernels): {total:.4f} ms", flush=True)
+        print(f"\n  trace -> {trace_path}", flush=True)
+
+    dist.barrier()
+    if rank == 0:
+        print(
+            f"\n  All traces saved to: {trace_dir}\n"
+            f"  使用 chrome://tracing 或 Perfetto UI 加载 .json 文件进行分析\n",
+            flush=True,
+        )
+
+
+# =========================================================================== #
 #                        进程入口
 # =========================================================================== #
 
@@ -941,27 +1057,37 @@ def test_loop(
         print(f"  use_quant    = {use_quant}", flush=True)
     dist.barrier()
     time.sleep(1)
-    for _ in range(1000):
-        if mode == "fixed":
-            test_fixed_correctness(
-                buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, group,
-                use_quant=use_quant,
-            )
-        elif mode == "random":
-            test_random_correctness(
-                buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, group,
-                use_quant=use_quant,
-            )
-        elif mode == "bench":
-            bench_performance(
-                buffer, num_tokens, hidden, num_topk, num_experts,
-                num_ranks, rank, group,
-                num_warmups=10,
-                num_tests=100,
-                use_quant=use_quant,
-            )
-        else:
-            raise ValueError(f"Unknown mode: {mode}. Choose from: fixed, random, bench")
+
+    if mode in ("fixed", "random"):
+        for _ in range(1000):
+            if mode == "fixed":
+                test_fixed_correctness(
+                    buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, group,
+                    use_quant=use_quant,
+                )
+            else:
+                test_random_correctness(
+                    buffer, num_tokens, hidden, num_topk, num_experts, num_ranks, rank, group,
+                    use_quant=use_quant,
+                )
+    elif mode == "bench":
+        bench_performance(
+            buffer, num_tokens, hidden, num_topk, num_experts,
+            num_ranks, rank, group,
+            num_warmups=10,
+            num_tests=100,
+            use_quant=use_quant,
+        )
+    elif mode == "profile":
+        bench_performance_kineto(
+            buffer, num_tokens, hidden, num_topk, num_experts,
+            num_ranks, rank, group,
+            num_tests=args.num_profile_tests,
+            trace_dir=args.trace_dir,
+            use_quant=use_quant,
+        )
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Choose from: fixed, random, bench, profile")
 
     dist.barrier()
     dist.destroy_process_group()
@@ -997,10 +1123,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mode", type=str, default="random",
-        choices=["fixed", "random", "bench"],
+        choices=["fixed", "random", "bench", "profile"],
         help="Test mode: 'fixed' for fixed-input correctness, "
              "'random' for random-input correctness (default), "
-             "'bench' for performance benchmark",
+             "'bench' for performance benchmark, "
+             "'profile' for kineto profiling with trace export",
     )
     parser.add_argument(
         "--shmem", type=int, default=1, choices=[0, 1],
@@ -1009,6 +1136,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use-quant", action="store_true", default=False,
         help="Enable int8 quantization for dispatch (default: disabled)",
+    )
+    parser.add_argument(
+        "--trace-dir", type=str, default="./traces",
+        help="Directory to save kineto trace files (default: ./traces, used with --mode profile)",
+    )
+    parser.add_argument(
+        "--num-profile-tests", type=int, default=30,
+        help="Number of test iterations per profiling stage (default: 30, used with --mode profile)",
     )
     args = parser.parse_args()
 

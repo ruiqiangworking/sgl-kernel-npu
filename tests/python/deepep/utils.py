@@ -71,25 +71,20 @@ def bench(fn, num_warmups: int = 50, num_tests: int = 50, post_fn=None):
     torch.npu.synchronize()
 
     # Timing
-    times = []
-    for _ in range(num_tests):
-        torch.npu.synchronize()
-        start = torch.npu.Event(enable_timing=True)
-        end = torch.npu.Event(enable_timing=True)
+    start = torch.npu.Event(enable_timing=True)
+    end = torch.npu.Event(enable_timing=True)
 
-        start.record()
+    start.record()
+    for i in range(num_tests):
         fn()
-        end.record()
-
         if post_fn is not None:
             post_fn()
+    end.record()
 
-        torch.npu.synchronize()
-        elapsed_time = start.elapsed_time(end) / 1e3  # ms -> s
-        times.append(elapsed_time)
-
-    times = np.array(times[1:])  # Remove the first timing
-    return np.average(times), np.min(times), np.max(times)
+    torch.npu.synchronize()
+    total_time = start.elapsed_time(end) / 1e3  # ms -> s
+    avg_time = total_time / num_tests
+    return avg_time, avg_time, avg_time
 
 
 def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
