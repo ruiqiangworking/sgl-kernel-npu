@@ -302,7 +302,7 @@ def call_intranode_dispatch(
     num_tokens_per_expert: torch.Tensor,
     config: deep_ep_cpp.Config,
     use_quant: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], list, tuple]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, tuple]:
     """
     调用 deep_ep_cpp.Buffer.intranode_dispatch。
 
@@ -468,22 +468,19 @@ def verify_dispatch_layout(
 
 def verify_dispatch_expert_tokens(
     gbl_num_tokens_per_expert: torch.Tensor,
-    recv_num_tokens_per_expert_list: list,
+    recv_num_tokens_per_expert: torch.Tensor,
     rank: int,
     num_ranks: int,
 ) -> None:
-    """校验 dispatch 返回的 num_recv_tokens_per_expert_list。"""
-    expert_token_nums_type = int(os.getenv("MOE_EXPERT_TOKEN_NUMS_TYPE", 1))
+    """校验 dispatch 返回的 recv_num_tokens_per_expert tensor。"""
     local_expert_token = gbl_num_tokens_per_expert.view(num_ranks, -1)[rank]
-    if expert_token_nums_type == 0:
-        expected = local_expert_token.cumsum(dim=0).tolist()
-    else:
-        expected = local_expert_token.tolist()
+    expected = local_expert_token.to(dtype=recv_num_tokens_per_expert.dtype,
+                                     device=recv_num_tokens_per_expert.device)
 
-    assert expected == recv_num_tokens_per_expert_list, (
-        f"num_recv_tokens_per_expert_list mismatch on rank {rank}:\n"
+    assert torch.equal(expected, recv_num_tokens_per_expert), (
+        f"recv_num_tokens_per_expert mismatch on rank {rank}:\n"
         f"  Expected: {expected}\n"
-        f"  Actual:   {recv_num_tokens_per_expert_list}"
+        f"  Actual:   {recv_num_tokens_per_expert}"
     )
     print(f"  rank {rank}: dispatch expert tokens PASSED", flush=True)
 

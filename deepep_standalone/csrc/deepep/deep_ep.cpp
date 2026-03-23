@@ -214,7 +214,7 @@ int Buffer::get_rdma_rank() const
 }
 
 std::tuple<at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>, std::optional<at::Tensor>,
-           std::vector<int>, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            std::optional<EventHandle>>
 Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> &x_scales,
                            const std::optional<at::Tensor> &topk_idx, const std::optional<at::Tensor> &topk_weights,
@@ -320,13 +320,6 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
     int64_t topk_num = expert_ids.size(1);
     int64_t local_rank_size = num_ranks;
     int64_t local_rank_id = rank % local_rank_size;
-    std::vector<int> num_recv_tokens_per_expert_list;
-    // indicates the value type of the output num_recv_tokens_per_expert_list, with a range of [0, 1]
-    // 0 means the prefix sum of the number of tokens received by each expert;
-    // 1 means the number of tokens received by each expert (default)
-    int expert_token_nums_type = get_value_from_env("MOE_EXPERT_TOKEN_NUMS_TYPE", 1);
-    EP_HOST_ASSERT(expert_token_nums_type == 1 or expert_token_nums_type == 0);
-
     char hcom_ep_name[HCOMM_NAME_LEN];
     int send_per_group, send_count;
     at::Tensor send_data, send_data_offset, recv_data, put_offset_, total_recv_token_, recv_count_, recv_offset_,
@@ -486,21 +479,12 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
                      expand_idx_out, dispatch_wait_recv_cost_stats_out);
     }
 
-    auto recv_token_per_exp_cpu = recv_tokens_per_expert_.to(at::kCPU);
-    auto recv_token_per_exp_ptr = recv_token_per_exp_cpu.data_ptr<int64_t>();
-
-    int token_cnt = 0;
-    for (int local_e = 0; local_e < num_local_experts; ++local_e) {
-        int current_tokens = static_cast<int>(recv_token_per_exp_ptr[local_e]);
-        token_cnt = (expert_token_nums_type == 0) ? token_cnt + current_tokens : current_tokens;
-        num_recv_tokens_per_expert_list.emplace_back(token_cnt);
-    }
     // Return values
     return {expandx_out,
             dynamic_scales_out,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list,
+            recv_tokens_per_expert_,
             rank_prefix_matrix,
             channel_prefix_matrix,
             recv_channel_prefix_matrix,
@@ -630,7 +614,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-           std::vector<int>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
            std::optional<EventHandle>>
 Buffer::internode_dispatch(
     const torch::Tensor &x, const std::optional<torch::Tensor> &x_scales, const std::optional<torch::Tensor> &topk_idx,
@@ -752,12 +736,6 @@ Buffer::internode_dispatch(
     int32_t server_num = num_ranks / local_rank_size;
     int64_t local_rank_id = rank % local_rank_size;
     auto new_num_tokens_per_expert = num_tokens_per_expert.value();
-    std::vector<int> num_recv_tokens_per_expert_list;
-    // indicates the value type of the output num_recv_tokens_per_expert_list, with a range of [0, 1]
-    // 0 means the prefix sum of the number of tokens received by each expert;
-    // 1 means the number of tokens received by each expert (default)
-    int expert_token_nums_type = get_value_from_env("MOE_EXPERT_TOKEN_NUMS_TYPE", 1);
-    EP_HOST_ASSERT(expert_token_nums_type == 1 or expert_token_nums_type == 0);
 
     // Corresponding to the output data and length of the layout
     auto new_send_data = this->notify_send_data;
@@ -822,21 +800,11 @@ Buffer::internode_dispatch(
                  dynamic_scales_out, expand_idx, expertTokenNums, epRecvCount, expand_scales,
                  dispatch_wait_recv_cost_stats_out);
 
-    auto recv_token_per_exp_cpu = recv_tokens_per_expert.to(at::kCPU);
-    auto recv_token_per_exp_ptr = recv_token_per_exp_cpu.data_ptr<int64_t>();
-
-    int token_cnt = 0;
-    for (int local_e = 0; local_e < num_local_experts; ++local_e) {
-        int current_tokens = static_cast<int>(recv_token_per_exp_ptr[local_e]);
-        token_cnt = (expert_token_nums_type == 0) ? token_cnt + current_tokens : current_tokens;
-        num_recv_tokens_per_expert_list.emplace_back(token_cnt);
-    }
-
     return {expandx_out,
             dynamic_scales_out,
             recv_topk_idx,
             recv_topk_weights,
-            num_recv_tokens_per_expert_list,
+            recv_tokens_per_expert,
             expand_idx,
             ep_rank_token_cnt,
             offset_inner,
