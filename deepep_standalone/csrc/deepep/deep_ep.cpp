@@ -382,9 +382,15 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
                      local_rank_size, local_rank_id, topk_num, ext_info, recv_data, total_recv_token_, max_bs_,
                      recv_tokens_per_expert_, put_offset_);
 
-        int64_t gBs = max_bs_.item<int>() * num_ranks;
-        int trt = total_recv_token_.item<int>();
-        int num_recv_tokens = (trt == 0) ? 1 : trt;  // max recv_tokens in all rank
+        int host_values[2] = {0, 0};  // [0]: max_bs, [1]: total_recv_token
+        {
+            auto acl_stream = c10_npu::getCurrentNPUStream().stream();
+            aclrtSynchronizeStream(acl_stream);
+            aclrtMemcpy(&host_values[0], sizeof(int), max_bs_.data_ptr<int>(), sizeof(int), ACL_MEMCPY_DEVICE_TO_HOST);
+            aclrtMemcpy(&host_values[1], sizeof(int), total_recv_token_.data_ptr<int>(), sizeof(int), ACL_MEMCPY_DEVICE_TO_HOST);
+        }
+        int64_t gBs = static_cast<int64_t>(host_values[0]) * num_ranks;
+        int num_recv_tokens = (host_values[1] == 0) ? 1 : host_values[1];  // max recv_tokens in all rank
 
         expandx_out =
             use_quant
