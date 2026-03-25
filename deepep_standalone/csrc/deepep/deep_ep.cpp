@@ -19,6 +19,8 @@ constexpr int MAX_BATCH_SIZE = 4096;
 constexpr int EXPERT_DATA_SIZE = 1 + MAX_BATCH_SIZE;  // 4097
 constexpr int A3_MAX_HCCS_PEERS = 384;
 constexpr int A2_MAX_HCCS_PEERS = 8;
+constexpr size_t SHMEM_LOCAL_MEM_SIZE = 4UL * 1024 * 1024 * 1024;   // 8 GB
+constexpr size_t SHMEM_META_DATA_SIZE = 100UL * 1024 * 1024;        // 100 MB
 
 torch::Tensor create_tensor_from_shmem(const std::vector<int64_t> &shape, at::ScalarType dtype, c10::Device &device)
 {
@@ -57,14 +59,21 @@ torch::Tensor create_tensor_from_shmem(const std::vector<int64_t> &shape, at::Sc
 }
 
 Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode,
-               std::string moe_all_to_all_group_name, std::string shmem_server_ipport)
+               std::string moe_all_to_all_group_name, std::string shmem_server_ipport,
+               int64_t hidden, int64_t num_experts_hint, int64_t num_topk,
+               bool use_quant, int64_t shmem_st_ratio_x)
     : rank(rank),
       num_ranks(num_ranks),
       num_nvl_bytes(num_nvl_bytes),
       num_rdma_bytes(num_rdma_bytes),
       low_latency_mode(low_latency_mode),
       moe_all_to_all_group_name(moe_all_to_all_group_name),
-      shmem_server_ipport(std::move(shmem_server_ipport))
+      shmem_server_ipport(std::move(shmem_server_ipport)),
+      hidden(hidden),
+      num_experts_hint(num_experts_hint),
+      num_topk(num_topk),
+      use_quant(use_quant),
+      shmem_st_ratio_x(shmem_st_ratio_x)
 {
     rdma_rank = rank;
     EP_HOST_ASSERT(0 <= rank and rank < num_ranks);
@@ -85,14 +94,12 @@ Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t n
 
     shmem_enable = (get_value_from_env("DEEPEP_SHMEM_ENABLE", 0) == 1);  // only open shmem with "1"
     if (shmem_enable) {
-        size_t local_mem_size = 8 * 1024 * 1024 * 1024UL;
-        size_t meta_data_size = 100 * 1024 * 1024UL;
         size_t ele_size = sizeof(int32_t);
-        size_t num_of_int32 = meta_data_size / ele_size;
+        size_t num_of_int32 = SHMEM_META_DATA_SIZE / ele_size;
 
         // To be initialized by the caller
         std::string shmem_uri = "tcp://" + this->shmem_server_ipport;
-        EP_HOST_ASSERT(rank == internode::init(rank, num_ranks, local_mem_size, shmem_uri.c_str()));
+        EP_HOST_ASSERT(rank == internode::init(rank, num_ranks, SHMEM_LOCAL_MEM_SIZE, shmem_uri.c_str()));
         shmem_ptr = internode::alloc(num_of_int32, ele_size);
     } else {
         if (moe_all_to_all_group_name.empty()) {
@@ -106,10 +113,93 @@ Buffer::Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t n
             EP_HOST_ASSERT(moe_all_to_all_group_name.size() < HCOMM_NAME_LEN);
         }
     }
+
+    // Pre-allocate shmem tensors when shmem is enabled and model hints are provided
+    if (shmem_enable && hidden > 0 && num_experts_hint > 0) {
+        auto device = c10::Device(c10::DeviceType::PrivateUse1, static_cast<c10::DeviceIndex>(0));
+        ACL_CHECK(aclrtGetDevice(&device_id));
+        device = c10::Device(c10::DeviceType::PrivateUse1, static_cast<c10::DeviceIndex>(device_id));
+        preallocate_shmem_tensors(device);
+    }
+}
+
+void Buffer::preallocate_shmem_tensors(c10::Device device)
+{
+    int64_t E = num_experts_hint;
+    int64_t R = num_ranks;
+    int64_t H = hidden;
+
+    // Element size: quant uses kChar (1 byte), non-quant uses bf16 (2 bytes)
+    size_t elem_size = use_quant ? 1 : 2;
+
+    // --- Fixed-size shmem tensors ---
+    // 1) num_tokens_per_expert: {E} x kInt = E * 4 bytes
+    c_shmem_num_tokens_per_expert = create_tensor_from_shmem(
+        std::vector<int64_t>{E}, at::kInt, device);
+
+    // 2) c_dispatch_shmem_recv_data: {R, E} x kInt = R * E * 4 bytes
+    c_dispatch_shmem_recv_data = create_tensor_from_shmem(
+        std::vector<int64_t>{R, E}, at::kInt, device);
+
+    // --- Compute max_recv_tokens to fill remaining shmem ---
+    // Total shmem pool = SHMEM_LOCAL_MEM_SIZE (8GB)
+    // Already consumed: SHMEM_META_DATA_SIZE (100MB) + fixed tensors above
+    size_t fixed_bytes = static_cast<size_t>(E) * 4 + static_cast<size_t>(R) * E * 4;
+
+    size_t avail_bytes = SHMEM_LOCAL_MEM_SIZE - SHMEM_META_DATA_SIZE - fixed_bytes;
+
+    // Per recv_token cost:
+    //   expandx_out:        H * elem_size  (quant: kChar=1B, non-quant: bf16=2B)
+    //   c_shmem_combine_x:  H * 2          (always bf16, dequantized in combine)
+    //   dynamic_scales_out: 4              (only when quant)
+    size_t per_token_bytes = static_cast<size_t>(H) * elem_size
+                           + static_cast<size_t>(H) * 2
+                           + (use_quant ? 4 : 0);
+
+    EP_HOST_ASSERT(per_token_bytes > 0);
+    max_recv_tokens = static_cast<int64_t>(avail_bytes / per_token_bytes);
+
+    // Ensure at least 1 token
+    if (max_recv_tokens < 1) {
+        max_recv_tokens = 1;
+    }
+
+    std::cout << "[DeepEP shmem] rank=" << rank
+              << " E=" << E << " R=" << R << " H=" << H
+              << " quant=" << use_quant
+              << " elem_size=" << elem_size
+              << " max_recv_tokens=" << max_recv_tokens
+              << " shmem_used=" << (SHMEM_META_DATA_SIZE + fixed_bytes + max_recv_tokens * per_token_bytes)
+              << "/" << SHMEM_LOCAL_MEM_SIZE << std::endl;
+
+    // --- Dynamic-size shmem tensors (pre-allocated to max_recv_tokens) ---
+    at::ScalarType x_dtype = use_quant ? at::kChar : at::kBFloat16;
+
+    // 3) expandx_out: {max_recv_tokens, H}
+    c_shmem_expandx_out = create_tensor_from_shmem(
+        std::vector<int64_t>{max_recv_tokens, H}, x_dtype, device);
+
+    // 4) c_shmem_combine_x: {max_recv_tokens, H} — always bf16 (dequantized in combine)
+    c_shmem_combine_x = create_tensor_from_shmem(
+        std::vector<int64_t>{max_recv_tokens, H}, at::kBFloat16, device);
+
+    // 5) dynamic_scales_out: {max_recv_tokens} (only quant)
+    if (use_quant) {
+        c_shmem_dynamic_scales_out = create_tensor_from_shmem(
+            std::vector<int64_t>{max_recv_tokens}, at::kFloat, device);
+    }
 }
 
 Buffer::~Buffer() noexcept(false)
 {
+    if (recv_token_copy_event) {
+        aclrtDestroyEvent(recv_token_copy_event);
+        recv_token_copy_event = nullptr;
+    }
+    if (pinned_recv_token_host) {
+        aclrtFreeHost(pinned_recv_token_host);
+        pinned_recv_token_host = nullptr;
+    }
     if (shmem_enable) {
         std::cout << "rank " << rank << " ~Buffer" << std::endl;
         internode::free(shmem_ptr);
@@ -157,7 +247,8 @@ Buffer::get_dispatch_layout(const torch::Tensor &topk_idx, int num_experts, std:
     auto device = new_topk_idx.device();
     at::Tensor num_tokens_per_expert;
     if (shmem_enable) {
-        num_tokens_per_expert = create_tensor_from_shmem(std::vector<int64_t>{num_experts}, at::kInt, device);
+        EP_HOST_ASSERT(c_shmem_num_tokens_per_expert.defined() && c_shmem_num_tokens_per_expert.size(0) == num_experts);
+        num_tokens_per_expert = c_shmem_num_tokens_per_expert;
     } else {
         num_tokens_per_expert = at::empty({num_experts}, at::dtype(at::kInt).device(device));
     }
@@ -333,12 +424,10 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
         // get shmem_ptr_info
         ext_info = (int64_t)shmem_ptr;
 
-        if (!c_dispatch_shmem_recv_data.defined() ||
-            c_dispatch_shmem_recv_data.size(0) != num_ranks ||
-            c_dispatch_shmem_recv_data.size(1) != num_experts) {
-            c_dispatch_shmem_recv_data = create_tensor_from_shmem(
-                std::vector<int64_t>{num_ranks, num_experts}, at::kInt, device);
-        }
+        // Use pre-allocated shmem tensor (no runtime reallocation)
+        EP_HOST_ASSERT(c_dispatch_shmem_recv_data.defined() &&
+                       c_dispatch_shmem_recv_data.size(0) == num_ranks &&
+                       c_dispatch_shmem_recv_data.size(1) == num_experts);
         recv_data = c_dispatch_shmem_recv_data;
         put_offset_ = torch::empty({num_experts, num_ranks}, at::dtype(at::kInt).device(device));
         if (!c_dispatch_total_recv_token.defined()) {
@@ -375,29 +464,34 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
                      local_rank_size, local_rank_id, topk_num, ext_info, recv_data, total_recv_token_, max_bs_,
                      recv_tokens_per_expert_, put_offset_);
 
-        int host_values[2] = {0, 0};  // [0]: max_bs, [1]: total_recv_token
+        // Queue async D2H copy of total_recv_token_ right after NotifyDispatch
+        // (total_recv_token_ is already written by NotifyDispatch at this point in stream order)
         {
             auto acl_stream = c10_npu::getCurrentNPUStream().stream();
-            aclrtSynchronizeStream(acl_stream);
-            aclrtMemcpy(&host_values[0], sizeof(int), max_bs_.data_ptr<int>(), sizeof(int), ACL_MEMCPY_DEVICE_TO_HOST);
-            aclrtMemcpy(&host_values[1], sizeof(int), total_recv_token_.data_ptr<int>(), sizeof(int), ACL_MEMCPY_DEVICE_TO_HOST);
+            // Lazily allocate pinned host buffer and event
+            if (!pinned_recv_token_host) {
+                ACL_CHECK(aclrtMallocHost(reinterpret_cast<void **>(&pinned_recv_token_host), sizeof(int)));
+            }
+            if (!recv_token_copy_event) {
+                ACL_CHECK(aclrtCreateEvent(&recv_token_copy_event));
+            }
+            // Async D2H copy: queued after NotifyDispatch, before MoeDispatchNormal
+            ACL_CHECK(aclrtMemcpyAsync(pinned_recv_token_host, sizeof(int),
+                                       total_recv_token_.data_ptr<int>(), sizeof(int),
+                                       ACL_MEMCPY_DEVICE_TO_HOST, acl_stream));
+            // Record event after the memcpy so we can sync on it independently
+            ACL_CHECK(aclrtRecordEvent(recv_token_copy_event, acl_stream));
         }
-        int64_t gBs = static_cast<int64_t>(host_values[0]) * num_ranks;
-        int num_recv_tokens = (host_values[1] == 0) ? 1 : host_values[1];  // max recv_tokens in all rank
 
-        expandx_out =
-            use_quant
-                ? create_tensor_from_shmem(std::vector<int64_t>{num_recv_tokens, hidden}, at::kChar, device)
-                : create_tensor_from_shmem(std::vector<int64_t>{num_recv_tokens, hidden}, x.scalar_type(), device);
-        dynamic_scales_out = use_quant
-                                 ? create_tensor_from_shmem(std::vector<int64_t>{num_recv_tokens}, at::kFloat, device)
-                                 : torch::empty({1}, at::dtype(at::kFloat).device(device));
+        // Use pre-allocated max-size shmem tensors directly (no sync for allocation)
+        EP_HOST_ASSERT(c_shmem_expandx_out.defined());
+        expandx_out = c_shmem_expandx_out;
+        dynamic_scales_out = use_quant ? c_shmem_dynamic_scales_out
+                                       : torch::empty({1}, at::dtype(at::kFloat).device(device));
         expand_idx_out = torch::empty({1}, at::dtype(at::kInt).device(device));  // not use
 
-        if (topk_idx.has_value()) {
-            recv_topk_idx = at::empty({num_recv_tokens, num_topk}, topk_idx->options());
-            recv_topk_weights = at::empty({num_recv_tokens, num_topk}, topk_weights->options());
-        }
+        // Use static max gBs; operator doesn't infer from output tensor shape
+        int64_t gBs = static_cast<int64_t>(MAX_BATCH_SIZE) * num_ranks;
 
         EXEC_NPU_CMD(aclnnShmemMoeDispatchNormal, new_x, expert_ids, send_token_idx_small, put_offset_,
                      num_ranks,  // rankSize
@@ -405,6 +499,27 @@ Buffer::intranode_dispatch(const at::Tensor &x, const std::optional<at::Tensor> 
                      tp_size, tp_rank, num_experts, quant_mode, gBs, ext_info,
                      // output params
                      expandx_out, dynamic_scales_out, expand_idx_out, dispatch_wait_recv_cost_stats_out);
+
+        // Sync only the D2H copy event — does NOT wait for MoeDispatchNormal to complete.
+        // total_recv_token_ was produced by NotifyDispatch and the async memcpy was queued
+        // before MoeDispatchNormal, so the event fires as soon as the 4-byte copy finishes.
+        int actual_recv_tokens = 0;
+        {
+            ACL_CHECK(aclrtSynchronizeEvent(recv_token_copy_event));
+            actual_recv_tokens = *pinned_recv_token_host;
+        }
+        if (actual_recv_tokens == 0) actual_recv_tokens = 1;
+
+        // Slice output tensors to actual received token count
+        expandx_out = expandx_out.slice(0, 0, actual_recv_tokens);
+        if (use_quant) {
+            dynamic_scales_out = dynamic_scales_out.slice(0, 0, actual_recv_tokens);
+        }
+
+        if (topk_idx.has_value()) {
+            recv_topk_idx = at::empty({actual_recv_tokens, num_topk}, topk_idx->options());
+            recv_topk_weights = at::empty({actual_recv_tokens, num_topk}, topk_weights->options());
+        }
     } else {
         send_per_group = 3;  // (send_to_expert_num, send_to_expert_offset, send_rank_tokens)
         send_count = send_per_group * num_local_experts * num_ranks;
@@ -572,18 +687,16 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
         moe_expert_number = put_offset.size(0);
         ext_info = reinterpret_cast<uint64_t>(shmem_ptr);
 
-        // x may not reside on shmem-allocated memory; copy it to a shmem tensor
-        // so the operator receives a tensor backed by symmetric shared memory.
-        if (!c_combine_shmem_x.defined() ||
-            c_combine_shmem_x.size(0) != recv_x.size(0) ||
-            c_combine_shmem_x.size(1) != hidden ||
-            c_combine_shmem_x.scalar_type() != recv_x.scalar_type()) {
-            c_combine_shmem_x = create_tensor_from_shmem(
-                std::vector<int64_t>{recv_x.size(0), hidden}, recv_x.scalar_type(), device);
-        }
-        c_combine_shmem_x.copy_(recv_x);
+        // Use pre-allocated shmem tensor (no runtime reallocation)
+        EP_HOST_ASSERT(c_shmem_combine_x.defined() &&
+                       recv_x.size(0) <= c_shmem_combine_x.size(0) &&
+                       c_shmem_combine_x.size(1) == hidden &&
+                       c_shmem_combine_x.scalar_type() == recv_x.scalar_type());
+        // Copy actual data into the prefix of pre-allocated shmem tensor
+        at::Tensor shmem_x = c_shmem_combine_x;
+        shmem_x.slice(0, 0, recv_x.size(0)).copy_(recv_x);
 
-        EXEC_NPU_CMD(aclnnShmemMoeCombineNormal, c_combine_shmem_x, ep_send_counts, expert_scales, expand_ids,
+        EXEC_NPU_CMD(aclnnShmemMoeCombineNormal, shmem_x, ep_send_counts, expert_scales, expand_ids,
                      this->send_token_idx_small, ext_info, num_ranks, rank, tp_world_size, tp_rankId, moe_expert_number,
                      global_bs, combined_x, combine_send_cost_stats_out);
     } else {

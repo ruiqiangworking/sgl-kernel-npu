@@ -162,7 +162,7 @@ def bench_kineto(
     with suppress():
         schedule = torch_npu.profiler.schedule(wait=1, warmup=0, active=1, repeat=1)
         with torch_npu.profiler.profile(
-            activities=[torch_npu.profiler.ProfilerActivity.NPU], schedule=schedule
+            activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU], schedule=schedule
         ) as prof:
             for i in range(2):
                 # NOTES: use a large kernel and a barrier to eliminate the unbalanced CPU launch overhead

@@ -28,10 +28,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("current_stream_wait", &deep_ep::EventHandle::current_stream_wait);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
-        .def(pybind11::init<int, int, int64_t, int64_t, bool, std::string, std::string>(),
+        .def(pybind11::init<int, int, int64_t, int64_t, bool, std::string, std::string,
+                            int64_t, int64_t, int64_t, bool, int64_t>(),
              py::arg("rank"), py::arg("num_ranks"), py::arg("num_nvl_bytes"), py::arg("num_rdma_bytes"),
              py::arg("low_latency_mode"), py::arg("moe_all_to_all_group_name"),
-             py::arg("shmem_server_ipport") = std::string("127.0.0.1:11222"))
+             py::arg("shmem_server_ipport") = std::string("127.0.0.1:11222"),
+             py::arg("hidden") = 0, py::arg("num_experts_hint") = 0, py::arg("num_topk") = 0,
+             py::arg("use_quant") = false, py::arg("shmem_st_ratio_x") = 8)
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)

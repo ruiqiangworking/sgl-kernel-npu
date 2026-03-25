@@ -8,6 +8,7 @@
 #include "hccl/hccl.h"
 #include "hccl/hccl_types.h"
 #include "aclnn/opdev/platform.h"
+#include <acl/acl_rt.h>
 
 #include "config.hpp"
 #include "event.hpp"
@@ -35,6 +36,14 @@ struct Buffer {
     int64_t shared_expert_rank_num;
     int64_t shared_expert_num = 1;
 
+    // Model-level constants set at construction (used for shmem pre-allocation)
+    int64_t hidden = 0;            // H: hidden dimension
+    int64_t num_experts_hint = 0;  // E: total number of experts
+    int64_t num_topk = 0;          // topK
+    bool use_quant = false;        // whether FP8/INT8 quantisation is used
+    int64_t shmem_st_ratio_x = 8; // S:T = 1 : x*topK, default x=8
+    int64_t max_recv_tokens = 0;   // pre-computed T_max for shmem pre-allocation
+
 private:
     std::string moe_all_to_all_group_name;
     std::string shmem_server_ipport;
@@ -56,6 +65,11 @@ private:
     at::Tensor c_dispatch_shmem_send_data_offset;      // {1}, kInt
     at::Tensor c_dispatch_shmem_recv_offset;           // {1}, kInt
     at::Tensor c_dispatch_shmem_recv_data;             // {num_ranks, num_experts}, kInt (shmem)
+    // Pre-allocated shmem tensors for dispatch/combine data path
+    at::Tensor c_shmem_num_tokens_per_expert;          // {E}, kInt (shmem) — get_dispatch_layout
+    at::Tensor c_shmem_expandx_out;                    // {max_recv_tokens, H}, kChar or x.dtype (shmem)
+    at::Tensor c_shmem_dynamic_scales_out;             // {max_recv_tokens}, kFloat (shmem, only quant)
+    at::Tensor c_shmem_combine_x;                      // {max_recv_tokens, H}, same as expandx_out (shmem)
     // cam path non-returned intermediates
     at::Tensor c_dispatch_cam_send_data;               // {num_experts * 3}, kInt
     at::Tensor c_dispatch_cam_send_data_offset;        // {num_experts}, kInt
@@ -63,11 +77,18 @@ private:
     at::Tensor c_dispatch_cam_recv_offset;             // {num_experts}, kInt
     // Tensor cache for intranode_combine
     at::Tensor c_combine_tp_send_counts;               // {1}, kInt
-    at::Tensor c_combine_shmem_x;                      // {num_recv_tokens, hidden}, shmem
+
+    // Pinned host memory + event for async D2H copy of total_recv_token
+    int *pinned_recv_token_host = nullptr;              // pinned host buffer (1 x int32)
+    aclrtEvent recv_token_copy_event = nullptr;         // event to sync only the D2H copy
+
+    void preallocate_shmem_tensors(c10::Device device);
 
 public:
     Buffer(int64_t rank, int64_t num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode,
-           std::string moe_all_to_all_group_name, std::string shmem_server_ipport = "127.0.0.1:11222");
+           std::string moe_all_to_all_group_name, std::string shmem_server_ipport = "127.0.0.1:11222",
+           int64_t hidden = 0, int64_t num_experts_hint = 0, int64_t num_topk = 0,
+           bool use_quant = false, int64_t shmem_st_ratio_x = 8);
 
     ~Buffer() noexcept(false);
 

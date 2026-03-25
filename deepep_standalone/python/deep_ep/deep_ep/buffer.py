@@ -24,6 +24,11 @@ class Buffer:
         allow_nvlink_for_low_latency_mode: bool = True,
         allow_mnnvl: bool = False,
         shmem_server_ipport: str = "127.0.0.1:11222",
+        hidden: int = 0,
+        num_experts: int = 0,
+        num_topk: int = 0,
+        use_quant: bool = False,
+        shmem_st_ratio_x: int = 8,
     ) -> None:
         """
         Initialize the communication buffer.
@@ -39,6 +44,11 @@ class Buffer:
             allow_nvlink_for_low_latency_mode: This parameter is deprecated and retained to ensure compatibility with DeepEP.
             allow_mnnvl: This parameter is deprecated and retained to ensure compatibility with DeepEP.
             shmem_server_ipport: the IP:Port address for Shmem communication domain (e.g. "192.168.1.1:11222").
+            hidden: the hidden dimension of model (H). When > 0 with shmem enabled, triggers shmem pre-allocation.
+            num_experts: the total number of experts (E). Used for shmem pre-allocation.
+            num_topk: the top-k value per token. Used to compute S:T ratio for shmem budget.
+            use_quant: whether FP8/INT8 quantisation is used. Affects shmem element size.
+            shmem_st_ratio_x: the ratio multiplier x in S:T = 1 : x*topK, default 8.
         """
 
         self.rank = group.rank()
@@ -60,6 +70,11 @@ class Buffer:
             low_latency_mode,
             moe_all_to_all_group_name,
             shmem_server_ipport,
+            hidden,
+            num_experts,
+            num_topk,
+            use_quant,
+            shmem_st_ratio_x,
         )
 
     @staticmethod
