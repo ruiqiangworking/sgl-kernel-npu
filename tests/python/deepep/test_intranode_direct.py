@@ -1027,6 +1027,13 @@ def test_loop(
         flush=True,
     )
 
+    num_tokens = random.randint(1, args.num_tokens)
+    hidden = args.hidden
+    num_topk = args.num_topk
+    num_experts = args.num_experts
+    mode = args.mode
+    use_quant = args.use_quant
+
     # 获取 HCCL 通信组名称（与 deep_ep.Buffer 相同逻辑）
     try:
         pg = group._get_backend(torch.device("npu"))
@@ -1041,16 +1048,13 @@ def test_loop(
         0,                             # num_rdma_bytes
         False,                         # low_latency_mode
         moe_all_to_all_group_name,     # moe_all_to_all_group_name
+        "127.0.0.1:11222",             # shmem_server_ipport
+        hidden,                        # hidden
+        num_experts,                   # num_experts_hint
+        num_topk,                      # num_topk
+        use_quant,                     # use_quant
     )
     print(f"[Rank {rank}] Buffer created OK.", flush=True)
-
-    num_tokens = random.randint(1, args.num_tokens)
-    hidden = args.hidden
-    num_topk = args.num_topk
-    num_experts = args.num_experts
-
-    mode = args.mode
-    use_quant = args.use_quant
 
     print_test_config(rank, num_tokens, hidden, num_topk, num_experts, num_ranks)
     if rank == 0:
