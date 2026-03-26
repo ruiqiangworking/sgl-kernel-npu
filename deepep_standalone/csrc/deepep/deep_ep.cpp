@@ -129,9 +129,6 @@ void Buffer::preallocate_shmem_tensors(c10::Device device)
     int64_t R = num_ranks;
     int64_t H = hidden;
 
-    // Element size: quant uses kChar (1 byte), non-quant uses bf16 (2 bytes)
-    size_t elem_size = use_quant ? 1 : 2;
-
     // --- Fixed-size shmem tensors ---
     // 1) num_tokens_per_expert: {E} x kInt = E * 4 bytes
     c_shmem_num_tokens_per_expert = create_tensor_from_shmem(
@@ -148,12 +145,10 @@ void Buffer::preallocate_shmem_tensors(c10::Device device)
 
     size_t avail_bytes = SHMEM_LOCAL_MEM_SIZE - SHMEM_META_DATA_SIZE - fixed_bytes;
 
-    // Per recv_token cost:
-    //   expandx_out:        H * elem_size  (quant: kChar=1B, non-quant: bf16=2B)
-    //   c_shmem_combine_x:  H * 2          (always bf16, dequantized in combine)
+    // Per recv_token cost (expandx_out and combine_x share the same shmem block):
+    //   shared block:       H * 2          (bf16 — the larger dtype, used by both)
     //   dynamic_scales_out: 4              (only when quant)
-    size_t per_token_bytes = static_cast<size_t>(H) * elem_size
-                           + static_cast<size_t>(H) * 2
+    size_t per_token_bytes = static_cast<size_t>(H) * 2
                            + (use_quant ? 4 : 0);
 
     EP_HOST_ASSERT(per_token_bytes > 0);
@@ -167,21 +162,32 @@ void Buffer::preallocate_shmem_tensors(c10::Device device)
     std::cout << "[DeepEP shmem] rank=" << rank
               << " E=" << E << " R=" << R << " H=" << H
               << " quant=" << use_quant
-              << " elem_size=" << elem_size
               << " max_recv_tokens=" << max_recv_tokens
               << " shmem_used=" << (SHMEM_META_DATA_SIZE + fixed_bytes + max_recv_tokens * per_token_bytes)
               << "/" << SHMEM_LOCAL_MEM_SIZE << std::endl;
 
     // --- Dynamic-size shmem tensors (pre-allocated to max_recv_tokens) ---
-    at::ScalarType x_dtype = use_quant ? at::kChar : at::kBFloat16;
+    // expandx_out and combine_x share the same underlying shmem block.
+    // Dispatch writes to expandx_out, expert computation reads it, then combine
+    // writes into combine_x — their lifetimes are strictly non-overlapping.
 
-    // 3) expandx_out: {max_recv_tokens, H}
-    c_shmem_expandx_out = create_tensor_from_shmem(
-        std::vector<int64_t>{max_recv_tokens, H}, x_dtype, device);
-
-    // 4) c_shmem_combine_x: {max_recv_tokens, H} — always bf16 (dequantized in combine)
+    // 3) c_shmem_combine_x: {max_recv_tokens, H} — always bf16, owns the shared shmem block
     c_shmem_combine_x = create_tensor_from_shmem(
         std::vector<int64_t>{max_recv_tokens, H}, at::kBFloat16, device);
+
+    // 4) c_shmem_expandx_out: view of the same shmem block as c_shmem_combine_x
+    if (use_quant) {
+        // quant: kChar view over the same memory (uses only half the bytes)
+        auto options = torch::TensorOptions().dtype(at::kChar).device(device);
+        c_shmem_expandx_out = at_npu::native::from_blob(
+            c_shmem_combine_x.data_ptr(),
+            c10::IntArrayRef({max_recv_tokens, H}),
+            [](void *) {},  // no-op deleter — c_shmem_combine_x owns the memory
+            options);
+    } else {
+        // non-quant: same dtype (bf16), directly alias
+        c_shmem_expandx_out = c_shmem_combine_x;
+    }
 
     // 5) dynamic_scales_out: {max_recv_tokens} (only quant)
     if (use_quant) {

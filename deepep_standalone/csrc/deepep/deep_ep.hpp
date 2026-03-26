@@ -67,9 +67,9 @@ private:
     at::Tensor c_dispatch_shmem_recv_data;             // {num_ranks, num_experts}, kInt (shmem)
     // Pre-allocated shmem tensors for dispatch/combine data path
     at::Tensor c_shmem_num_tokens_per_expert;          // {E}, kInt (shmem) — get_dispatch_layout
-    at::Tensor c_shmem_expandx_out;                    // {max_recv_tokens, H}, kChar or x.dtype (shmem)
+    at::Tensor c_shmem_expandx_out;                    // {max_recv_tokens, H}, kChar or bf16 — shares shmem with combine_x
     at::Tensor c_shmem_dynamic_scales_out;             // {max_recv_tokens}, kFloat (shmem, only quant)
-    at::Tensor c_shmem_combine_x;                      // {max_recv_tokens, H}, same as expandx_out (shmem)
+    at::Tensor c_shmem_combine_x;                      // {max_recv_tokens, H}, bf16 — owns the shared shmem block
     // cam path non-returned intermediates
     at::Tensor c_dispatch_cam_send_data;               // {num_experts * 3}, kInt
     at::Tensor c_dispatch_cam_send_data_offset;        // {num_experts}, kInt
