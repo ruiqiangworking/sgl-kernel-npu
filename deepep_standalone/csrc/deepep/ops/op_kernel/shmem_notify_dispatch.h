@@ -366,25 +366,22 @@ private:
         LocalTensor<float> floatExpTokenSumCntLt = tmpBuf3_.Get<float>();
         LocalTensor<float> sharedTmpBuffer = tmpBuf4_.Get<float>();
 
-        int32_t sumVal = 0;  // 所有rank中接收token最大的
-        for (uint32_t srcRankId = 0; srcRankId < epWorldSize_; srcRankId++) {
-            ReorderRecvDataOutput(srcRankId, recvTokenLt, false);  // localExpNum * ranks
+        // 只计算当前 rank (epRankId_) 实际接收到的 token 总量
+        ReorderRecvDataOutput(epRankId_, recvTokenLt, false);  // localExpNum * epWorldSize_
 
-            SyncFunc<AscendC::HardEvent::MTE2_V>();
-            Cast(floatExpTokenCntLt, recvTokenLt, RoundMode::CAST_NONE, numExperts);
-            PipeBarrier<PIPE_V>();
-            ReduceSum(floatExpTokenSumCntLt, floatExpTokenCntLt, sharedTmpBuffer, numExperts);
-            SyncFunc<AscendC::HardEvent::V_S>();
-            int32_t recvCnt = static_cast<int32_t>(floatExpTokenSumCntLt.GetValue(0));
-            PipeBarrier<PIPE_ALL>();
-            sumVal = sumVal > recvCnt ? sumVal : recvCnt;
-        }
+        SyncFunc<AscendC::HardEvent::MTE2_V>();
+        Cast(floatExpTokenCntLt, recvTokenLt, RoundMode::CAST_NONE, numExperts);
+        PipeBarrier<PIPE_V>();
+        ReduceSum(floatExpTokenSumCntLt, floatExpTokenCntLt, sharedTmpBuffer, numExperts);
+        SyncFunc<AscendC::HardEvent::V_S>();
+        int32_t recvCnt = static_cast<int32_t>(floatExpTokenSumCntLt.GetValue(0));
+        PipeBarrier<PIPE_ALL>();
 
         // 拷贝到outputGT
         GlobalTensor<int32_t> totalCntGt;
         totalCntGt.SetGlobalBuffer((__gm__ int32_t *)totalRecvTokens_);
 
-        totalCntGt.SetValue(0, sumVal);
+        totalCntGt.SetValue(0, recvCnt);
         DataCacheCleanAndInvalid<int32_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(totalCntGt);
     }
 
